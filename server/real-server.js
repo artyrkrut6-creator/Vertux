@@ -21,11 +21,17 @@ if (PROXY_URL) {
   try { agent = new HttpsProxyAgent(PROXY_URL); } catch (_) {}
 }
 
-// --- CONSTANTS ---
+// --- CONSTANTS (RELAXED FOR AI) ---
 const MIN_PRICE_FT = 0.02;
 const MIN_PRICE_AI = 0.10;
 const MIN_QUOTEVOL_FT = 700_000;
 const MIN_QUOTEVOL_AI = 2_500_000;
+// Relaxed thresholds:
+const MAX_SPREAD_FT_PCT = 0.50;
+const MAX_SPREAD_AI_PCT = 0.40; // Was 0.20
+const DEPTH_BAND_PCT = 0.20;
+const MIN_DEPTH_FT_USDT = 10_000;
+const MIN_DEPTH_AI_USDT = 10_000; // Was 15k
 const BACKTEST_KLINES = 40;
 const CHUNK_SIZE = 20; 
 const UI_INTERVAL = 300_000; 
@@ -159,8 +165,9 @@ JSON OUTPUT FORMAT: { "target_price": number, "stop_loss_price": number, "direct
   } catch (e) { return null; }
 }
 
-// --- ADAPTIVE PICKER ---
+// --- ADAPTIVE PICKER (RELAXED) ---
 async function pickAiWithAdaptiveGates(aiPool) {
+  // Relaxed: Spread 0.40, Depth 10k, StdDev 0.25, Backtest 0.35
   const adaptiveSteps = [{ gates: { maxSpreadPct: 0.40, minDepth: 10_000, stddevMax: 0.25, backtestMean: 0.35 } }];
   const accepted = [];
   const pool = aiPool.slice().sort((a,b) => b.quoteVolume - a.quoteVolume).slice(0, 10);
@@ -204,33 +211,44 @@ async function checkUser(id) {
   try { const u = await User.findOne({ tgId: String(id) }); return u && u.isPremium && u.expiresAt > Date.now(); } catch(e){ return false; }
 }
 
-// global notifier (will be replaced when bot is initialized)
-let notifyProUsers = async (message) => { console.log('[notifyProUsers] noop — bot not ready:', message); };
+// NOTIFICATION HELPER
+let notifyProUsers = async (message) => { console.log('[notifyProUsers] noop', message); };
 
 if (TG_BOT_TOKEN) {
     try {
         const bot = new Telegraf(TG_BOT_TOKEN);
 
-        // real notifier using bot.telegram — replaces the noop above
+        // Реальная функция уведомлений
         notifyProUsers = async (message) => {
           try {
             const users = await User.find({ isPremium: true, notificationsEnabled: true }).lean().exec();
             for (const u of users) {
-              try { await bot.telegram.sendMessage(u.tgId, message); } catch (e) { /* ignore per-user errors */ }
+              try { await bot.telegram.sendMessage(u.tgId, message); } catch (e) {}
             }
-          } catch (e) { console.warn('[notifyProUsers] error', e); }
+          } catch (e) { console.warn('Notify Error:', e); }
         };
 
-        // Menu command and quick keyboard
-        bot.command('menu', async (ctx) => {
-          try {
-            await ctx.reply('Menu', Markup.keyboard([['🚀 Launch App'], ['👤 Profile','⚙️ Settings']]).resize().oneTime());
-          } catch (e) { console.warn('menu error', e); }
+        bot.command('menu', (ctx) => ctx.reply('Menu', Markup.keyboard([['🚀 Launch App'], ['👤 Profile', '⚙️ Settings']]).resize()));
+        
+        bot.hears('👤 Profile', async (ctx) => {
+            const u = await User.findOne({ tgId: String(ctx.from.id) });
+            const status = (u && u.isPremium) ? `PRO (Expires: ${new Date(u.expiresAt).toLocaleDateString()})` : 'FREE';
+            ctx.reply(`🆔 ID: ${ctx.from.id}\n🌟 Status: ${status}`);
+        });
+
+        bot.hears('⚙️ Settings', (ctx) => {
+            ctx.reply('Settings:', Markup.inlineKeyboard([Markup.button.callback('🔔 Toggle Alerts', 'toggle_alerts')]));
+        });
+
+        bot.action('toggle_alerts', async (ctx) => {
+            const u = await User.findOne({ tgId: String(ctx.from.id) });
+            if (!u || !u.isPremium) return ctx.answerCbQuery('Only for PRO users');
+            u.notificationsEnabled = !u.notificationsEnabled;
+            await u.save();
+            ctx.editMessageText(`Notifications: ${u.notificationsEnabled ? 'ON ✅' : 'OFF 🔕'}`);
         });
 
         bot.start(async (ctx) => {
-            const uid = ctx.from?.id;
-            // DO NOT DEACTIVATE ON START
             try {
                 await ctx.reply('Welcome to Vortex AI! 🚀', Markup.inlineKeyboard([
                     Markup.button.webApp('📱 Launch App', WEBAPP_URL),
@@ -244,55 +262,6 @@ if (TG_BOT_TOKEN) {
                 await ctx.answerCbQuery();
                 await ctx.reply('Price: 1000 RUB. Click below when paid.', Markup.inlineKeyboard([Markup.button.callback('✅ I Paid', 'paid')]));
             } catch(e){}
-        });
-
-        // Profile (user-initiated)
-        bot.hears('👤 Profile', async (ctx) => {
-          try {
-            const uid = ctx.from?.id;
-            if (!uid) return;
-            if (mongoose.connection && mongoose.connection.readyState !== 1) {
-              await ctx.reply('System initializing, please wait...');
-              return;
-            }
-            const u = await User.findOne({ tgId: String(uid) }).lean().exec();
-            const status = (u && u.isPremium && (!u.expiresAt || u.expiresAt > Date.now())) ? `PRO (until ${u && u.expiresAt ? new Date(u.expiresAt).toISOString().slice(0,10) : 'forever'})` : 'FREE';
-            const notif = (u && u.notificationsEnabled) ? 'ON' : 'OFF';
-            await ctx.reply(`ID: ${uid}\nStatus: ${status}\nNotifications: ${notif}`);
-          } catch (e) { console.warn('profile error', e); }
-        });
-
-        // Settings - show toggle
-        bot.hears('⚙️ Settings', async (ctx) => {
-          try {
-            await ctx.reply('Settings', Markup.inlineKeyboard([Markup.button.callback('🔔 Toggle AI Alerts', 'toggle_notifications')]));
-          } catch (e) { console.warn('settings error', e); }
-        });
-
-        bot.action('toggle_notifications', async (ctx) => {
-          try {
-            const uid = ctx.from?.id;
-            if (!uid) return await ctx.answerCbQuery();
-            if (mongoose.connection && mongoose.connection.readyState !== 1) {
-              await ctx.reply('System initializing, please wait...');
-              return await ctx.answerCbQuery();
-            }
-            const isPro = await checkUser(uid);
-            if (!isPro) {
-              await ctx.reply('You need PRO to toggle AI alerts. Open /menu to buy.');
-              return await ctx.answerCbQuery();
-            }
-            const u = await User.findOne({ tgId: String(uid) }).exec();
-            if (!u) {
-              await User.create({ tgId: String(uid), isPremium: true, expiresAt: Date.now() + 30*24*3600000, notificationsEnabled: true });
-              await ctx.reply('Notifications enabled');
-              return await ctx.answerCbQuery();
-            }
-            u.notificationsEnabled = !u.notificationsEnabled;
-            await u.save();
-            await ctx.reply(`Notifications ${u.notificationsEnabled ? 'enabled' : 'disabled'}`);
-            return await ctx.answerCbQuery();
-          } catch (e) { console.warn('toggle_notifications error', e); try{ await ctx.answerCbQuery(); }catch(_){} }
         });
 
         bot.action('paid', async (ctx) => {
@@ -363,10 +332,11 @@ async function runScannerJob() {
         const aiPool = base.filter(x => x.quoteVolume > MIN_QUOTEVOL_AI);
         const newPicks = await pickAiWithAdaptiveGates(aiPool);
         newPicks.forEach(p => {
-          if (!activeSignals.has(p.symbol)) {
-            activeSignals.set(p.symbol, { ...p, tag: 'AI', detectedAt: Date.now(), status: 'ACTIVE', addedAt: Date.now() });
-            try { notifyProUsers(`🚨 New AI Signal: ${p.symbol} ${p.direction || ''}!`); } catch(_){}
-          }
+            if (!activeSignals.has(p.symbol)) {
+                activeSignals.set(p.symbol, { ...p, tag: 'AI', detectedAt: Date.now(), status: 'ACTIVE', addedAt: Date.now() });
+                // NOTIFY USERS
+                notifyProUsers(`🚨 New AI Signal: ${p.symbol} ${p.direction || ''}! Target: ${p.target_price}`);
+            }
         });
     }
 
@@ -414,7 +384,7 @@ async function runScannerJob() {
   finally { scanInFlight = false; }
 }
 
-// --- ROUTES ---
+// --- SERVER START ---
 app.get('/api/user/status', async (req, res) => {
     const id = req.query.tg_id;
     const hasAccess = await checkUser(id);
