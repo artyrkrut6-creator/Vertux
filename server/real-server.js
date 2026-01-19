@@ -244,7 +244,7 @@ const mongoose = require('mongoose');
 
 const MONGO_URI = process.env.MONGO_URI || null;
 if (MONGO_URI) {
-  mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+  mongoose.connect(MONGO_URI)
     .then(() => console.log('[DB] Connected to MongoDB'))
     .catch((err) => console.warn('[DB] MongoDB connection error', err));
 } else {
