@@ -239,29 +239,52 @@ function loadPersistedSignals() {
   } catch (e) {}
 }
 
-// --- SIMPLE USERS DB (JSON) ---
-const USERS_FILE = path.join(__dirname, 'users.json');
-function readUsers() {
+// --- USERS (MongoDB via Mongoose) ---
+const mongoose = require('mongoose');
+
+const MONGO_URI = process.env.MONGO_URI || null;
+if (MONGO_URI) {
+  mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+    .then(() => console.log('[DB] Connected to MongoDB'))
+    .catch((err) => console.warn('[DB] MongoDB connection error', err));
+} else {
+  console.warn('[DB] MONGO_URI not set - users will not persist to MongoDB');
+}
+
+const UserSchema = new mongoose.Schema({ tgId: { type: String, index: true, unique: true }, isPremium: Boolean, expiresAt: Number }, { timestamps: true });
+const User = mongoose.models.User || mongoose.model('User', UserSchema);
+
+async function activateUser(tgId, durationMs = 365 * 24 * 3600 * 1000) {
+  if (!tgId) return null;
   try {
-    if (!fs.existsSync(USERS_FILE)) return [];
-    const raw = fs.readFileSync(USERS_FILE, 'utf8');
-    return JSON.parse(raw || '[]');
-  } catch (e) { return []; }
+    const expire = Date.now() + Number(durationMs);
+    const u = await User.findOneAndUpdate(
+      { tgId: String(tgId) },
+      { tgId: String(tgId), isPremium: true, expiresAt: expire },
+      { upsert: true, new: true }
+    ).exec();
+    return u;
+  } catch (e) { console.warn('[DB] activateUser error', e); return null; }
 }
-function writeUsers(list) {
-  try { fs.writeFileSync(USERS_FILE, JSON.stringify(list, null, 2)); } catch (e) {}
+
+async function deactivateUser(tgId) {
+  if (!tgId) return null;
+  try {
+    const u = await User.findOneAndUpdate(
+      { tgId: String(tgId) },
+      { isPremium: false, expiresAt: null },
+      { upsert: true, new: true }
+    ).exec();
+    return u;
+  } catch (e) { console.warn('[DB] deactivateUser error', e); return null; }
 }
-function getUser(tgId) {
-  const list = readUsers();
-  return list.find(u => Number(u.id) === Number(tgId));
-}
-function setUserPremium(tgId, isPremium, expireDate = null) {
-  const list = readUsers();
-  let u = list.find(x => Number(x.id) === Number(tgId));
-  if (!u) { u = { id: Number(tgId), isPremium: !!isPremium, expireDate: expireDate }; list.push(u); }
-  else { u.isPremium = !!isPremium; u.expireDate = expireDate; }
-  writeUsers(list);
-  return u;
+
+async function checkUser(tgId) {
+  if (!tgId) return false;
+  try {
+    const u = await User.findOne({ tgId: String(tgId) }).lean().exec();
+    return !!(u && u.isPremium && (!u.expiresAt || Number(u.expiresAt) > Date.now()));
+  } catch (e) { console.warn('[DB] checkUser error', e); return false; }
 }
 
 // --- TELEGRAM BOT (Telegraf) ---
@@ -276,7 +299,7 @@ try {
 
       bot.start(async (ctx) => {
         const uid = ctx.from && ctx.from.id;
-        if (uid) setUserPremium(uid, false, null);
+        if (uid) await deactivateUser(uid);
         try {
           await ctx.reply('Welcome to Vortex AI! Use the buttons below to open the WebApp or buy PRO.', Markup.inlineKeyboard([
             Markup.button.webApp('🚀 Launch Vortex AI', WEBAPP_URL),
@@ -299,10 +322,10 @@ try {
         try {
           const uid = ctx.from && ctx.from.id;
           if (uid) {
-            setUserPremium(uid, true, Date.now() + 365*24*3600*1000);
+            await activateUser(uid, 365*24*3600*1000);
             await ctx.reply('Thank you! Your account has been activated as Premium for testing purposes.');
           }
-        } catch (e) {}
+        } catch (e) { console.warn('[TG] paid handler error', e); }
       });
 
       bot.command('activate', async (ctx) => {
@@ -310,9 +333,9 @@ try {
           const parts = (ctx.message && ctx.message.text || '').split(/\s+/);
           if (parts.length < 2) return ctx.reply('Usage: /activate <tg_id>');
           const id = Number(parts[1]);
-          setUserPremium(id, true, Date.now() + 365*24*3600*1000);
+          await activateUser(id, 365*24*3600*1000);
           return ctx.reply(`Activated ${id}`);
-        } catch (e) { return; }
+        } catch (e) { console.warn('[TG] activate command error', e); return; }
       });
 
       bot.launch().then(() => console.log('[TG] Bot started')).catch((e) => console.warn('[TG] Bot launch failed', e));
@@ -320,27 +343,24 @@ try {
   }
 } catch (e) { console.warn('[TG] Bot init error', e); }
 
-// --- SIMPLE API: user status ---
-app.get('/api/user/status', (req, res) => {
+// --- API: user status ---
+app.get('/api/user/status', async (req, res) => {
   try {
-    const id = Number(req.query.tg_id || req.query.id);
+    const id = req.query.tg_id || req.query.id;
     if (!id) return res.json({ isPremium: false });
-    const u = getUser(id);
-    const ok = !!(u && u.isPremium && (!u.expireDate || Number(u.expireDate) > Date.now()));
-    return res.json({ isPremium: ok });
+    const ok = await checkUser(id);
+    return res.json({ isPremium: !!ok });
   } catch (e) { return res.json({ isPremium: false }); }
 });
 
 // --- Reset Premium (for testing) ---
-app.get('/api/user/reset', (req, res) => {
+app.get('/api/user/reset', async (req, res) => {
   try {
-    const id = Number(req.query.tg_id || req.query.id);
+    const id = req.query.tg_id || req.query.id;
     if (!id) {
-      // If no tg id provided, respond ok but no-op
       return res.json({ ok: false, message: 'missing tg_id' });
     }
-    // mark user as non-premium for testing
-    setUserPremium(id, false, null);
+    await deactivateUser(id);
     return res.json({ ok: true });
   } catch (e) {
     return res.json({ ok: false });
