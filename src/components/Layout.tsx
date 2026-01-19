@@ -13,7 +13,11 @@ const Layout: React.FC = () => {
   const [selected, setSelected] = useState<string | undefined>('BTCUSDT');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
+  
+  // View State for Mobile (List vs Chart)
   const [viewState, setViewState] = useState<'LIST' | 'CHART'>('LIST');
+  
+  // Panel State for Desktop (Normal / Full / Hidden)
   const [panelState, setPanelState] = useState<'NORMAL' | 'FULL' | 'HIDDEN'>('NORMAL');
 
   const coins = useScannerStore((s) => s.coins || []);
@@ -50,6 +54,7 @@ const Layout: React.FC = () => {
     return () => window.removeEventListener('resize', checkMobile);
   }, []);
 
+  // Sync mobile view state
   useEffect(() => {
     if (!isMobile) setViewState('LIST');
   }, [isMobile]);
@@ -65,7 +70,6 @@ const Layout: React.FC = () => {
       if (!Array.isArray(list)) return;
       for (const item of list) {
         if (!item?.symbol || !item?.tag) continue;
-        const changeRaw = item.change24hPct ?? item.priceChangePercent;
         const coin: DetectedCoin = {
           symbol: String(item.symbol).toUpperCase(),
           tag: item.tag === 'AI' ? 'AI' : 'FT',
@@ -98,7 +102,10 @@ const Layout: React.FC = () => {
     return () => { alive = false; try { es?.close(); } catch (_) {} };
   }, [addDetectedCoin, setNextScanAt]);
 
-  const handleSelect = (s: string) => { setSelected(s); if (isMobile) setViewState('CHART'); };
+  const handleSelect = (s: string) => { 
+      setSelected(s); 
+      if (isMobile) setViewState('CHART'); 
+  };
 
   const tradeLink = `https://www.mexc.com/exchange/${(selected || 'BTCUSDT').replace('USDT', '_USDT')}`;
   const currentCoin = coins.find(c => String(c.symbol).toUpperCase() === String(selected || '').toUpperCase());
@@ -155,7 +162,7 @@ const Layout: React.FC = () => {
                     <ChartContainer symbol={selected ?? 'BTCUSDT'} />
                   </div>
 
-                  {/* Mobile Bottom Panel */}
+                  {/* Mobile Bottom Panel (Fixed Height) */}
                   <div className="h-[35%] shrink-0 border-t border-white/10 bg-black/20 overflow-y-auto">
                      <div className="p-2">
                         <ChartBottomPanel coin={currentCoin} />
@@ -182,7 +189,7 @@ const Layout: React.FC = () => {
               )}
             </AnimatePresence>
 
-            <motion.main 
+            <motion.div 
               layout
               className="flex-1 flex flex-col h-full min-w-0 bg-white/5 border border-white/10 rounded-2xl backdrop-blur-xl shadow-2xl relative overflow-hidden"
             >
@@ -240,7 +247,7 @@ const Layout: React.FC = () => {
                   </motion.div>
                 )}
               </AnimatePresence>
-            </motion.main>
+            </motion.div>
           </>
         )}
       </div>
