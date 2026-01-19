@@ -13,11 +13,7 @@ const Layout: React.FC = () => {
   const [selected, setSelected] = useState<string | undefined>('BTCUSDT');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
-  
-  // View State for Mobile (List vs Chart)
   const [viewState, setViewState] = useState<'LIST' | 'CHART'>('LIST');
-  
-  // Panel State for Desktop (Normal / Full / Hidden)
   const [panelState, setPanelState] = useState<'NORMAL' | 'FULL' | 'HIDDEN'>('NORMAL');
 
   const coins = useScannerStore((s) => s.coins || []);
@@ -54,7 +50,6 @@ const Layout: React.FC = () => {
     return () => window.removeEventListener('resize', checkMobile);
   }, []);
 
-  // Sync mobile view state
   useEffect(() => {
     if (!isMobile) setViewState('LIST');
   }, [isMobile]);
@@ -102,10 +97,7 @@ const Layout: React.FC = () => {
     return () => { alive = false; try { es?.close(); } catch (_) {} };
   }, [addDetectedCoin, setNextScanAt]);
 
-  const handleSelect = (s: string) => { 
-      setSelected(s); 
-      if (isMobile) setViewState('CHART'); 
-  };
+  const handleSelect = (s: string) => { setSelected(s); if (isMobile) setViewState('CHART'); };
 
   const tradeLink = `https://www.mexc.com/exchange/${(selected || 'BTCUSDT').replace('USDT', '_USDT')}`;
   const currentCoin = coins.find(c => String(c.symbol).toUpperCase() === String(selected || '').toUpperCase());
@@ -247,7 +239,7 @@ const Layout: React.FC = () => {
                   </motion.div>
                 )}
               </AnimatePresence>
-            </main>
+            </motion.div>
           </>
         )}
       </div>
