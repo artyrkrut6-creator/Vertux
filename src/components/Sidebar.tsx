@@ -265,27 +265,28 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
           {/* LOCKED OVERLAY */}
           {!isPremium && sorted.length > 2 && (
             <div className="absolute bottom-0 left-0 w-full h-2/3 bg-gradient-to-t from-black via-black/80 to-transparent flex flex-col items-center justify-end pb-10 z-50 pointer-events-auto">
-               <div className="bg-white/10 backdrop-blur-xl border border-white/20 p-4 rounded-2xl shadow-2xl flex flex-col items-center gap-3 w-3/4">
-                  <div className="w-10 h-10 bg-violet-600 rounded-full flex items-center justify-center shadow-[0_0_15px_#7c3aed] animate-pulse">
-                     <Lock size={20} className="text-white" />
-                  </div>
-                  <div className="text-center">
-                     <h3 className="text-white font-bold text-sm">PRO ACCESS LOCKED</h3>
-                     <p className="text-gray-400 text-[10px] mt-1">Unlock AI Signals & Full List</p>
-                  </div>
-                  <button 
-                    onClick={() => {
-                        if ((window as any).Telegram?.WebApp) {
-                            try { (window as any).Telegram.WebApp.sendData("buy_pro"); } catch(_) { (window as any).Telegram.WebApp.close(); }
-                        } else {
-                            alert("Open in Telegram to buy!");
-                        }
-                    }}
-                    className="w-full py-2 bg-gradient-to-r from-violet-600 to-indigo-600 rounded-lg text-xs font-bold text-white shadow-lg hover:scale-105 transition-transform"
-                  >
-                    UNLOCK FOR 1000₽
-                  </button>
-               </div>
+            <div className="bg-white/10 backdrop-blur-xl border border-white/20 p-4 rounded-2xl shadow-2xl flex flex-col items-center gap-3 w-3/4">
+              <div className="w-10 h-10 bg-violet-600 rounded-full flex items-center justify-center shadow-[0_0_15px_#7c3aed] animate-pulse">
+                <Lock size={20} className="text-white" />
+              </div>
+              <div className="text-center">
+                <h3 className="text-white font-bold text-sm">PRO ACCESS LOCKED</h3>
+                <p className="text-gray-400 text-[10px] mt-1">Unlock AI Signals & Full List</p>
+              </div>
+              <button 
+                onClick={() => {
+                  const tg = (window as any).Telegram?.WebApp;
+                  if (tg) {
+                     try { tg.sendData("buy_pro"); tg.close(); } catch (e) { try { tg.close(); } catch(_){} }
+                  } else {
+                     window.open('https://t.me/VortexAIScannerBot', '_blank');
+                  }
+                }}
+                className="w-full py-2 bg-gradient-to-r from-violet-600 to-indigo-600 rounded-lg text-xs font-bold text-white shadow-lg hover:scale-105 transition-transform"
+              >
+                UNLOCK FOR 1000₽
+              </button>
+            </div>
             </div>
           )}
 

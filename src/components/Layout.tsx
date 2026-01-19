@@ -110,6 +110,35 @@ const Layout: React.FC = () => {
   const tradeLink = `https://www.mexc.com/exchange/${(selected || 'BTCUSDT').replace('USDT', '_USDT')}`;
   const currentCoin = coins.find(c => String(c.symbol).toUpperCase() === String(selected || '').toUpperCase());
 
+  // Triple-click reset helper
+  const resetClicks = React.useRef(0);
+  const resetTimer = React.useRef<number | null>(null);
+
+  const doResetUser = async () => {
+    try {
+      // try get tg id from WebApp
+      // @ts-ignore
+      const tg = (window as any).Telegram?.WebApp;
+      const id = tg?.initDataUnsafe?.user?.id;
+      const url = id ? `/api/user/reset?tg_id=${id}` : '/api/user/reset';
+      const r = await fetch(url);
+      const j = await r.json().catch(() => ({}));
+      // update store
+      setPremium(false);
+      try { alert('Premium reset: ' + (j.ok ? 'OK' : JSON.stringify(j))); } catch(_){}
+    } catch (e) { try { alert('Reset failed'); } catch(_){} }
+  };
+
+  const onTitleClick = () => {
+    resetClicks.current += 1;
+    if (resetTimer.current) window.clearTimeout(resetTimer.current as any);
+    resetTimer.current = window.setTimeout(() => { resetClicks.current = 0; resetTimer.current = null; }, 800) as any;
+    if (resetClicks.current >= 3) {
+      resetClicks.current = 0;
+      if (confirm && confirm('Reset premium for current Telegram user?')) doResetUser();
+    }
+  };
+
   return (
     <div className="h-screen bg-[#050505] text-white overflow-hidden flex flex-col font-sans selection:bg-violet-500/30">
       <div className="fixed inset-0 pointer-events-none z-0">
@@ -207,7 +236,7 @@ const Layout: React.FC = () => {
                         </button>
                     )}
                     <div className="h-6 w-[1px] bg-white/10 mx-2" />
-                    <span className="font-bold text-lg tracking-tight text-white/90">{selected || 'BTCUSDT'}</span>
+                    <span onClick={onTitleClick} className="font-bold text-lg tracking-tight text-white/90">{selected || 'BTCUSDT'}</span>
                  </div>
                  <a href={tradeLink} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 px-4 py-1.5 bg-gradient-to-r from-violet-600 to-indigo-600 rounded-lg shadow-lg shadow-violet-500/20 hover:shadow-violet-500/40 hover:scale-105 active:scale-95 transition-all group">
                    <span className="text-xs font-bold tracking-wide">TRADE</span>
@@ -225,7 +254,7 @@ const Layout: React.FC = () => {
                 {panelState !== 'HIDDEN' && (
                   <motion.div 
                     initial={{ height: 0, opacity: 0 }} 
-                    animate={{ height: panelState === 'FULL' ? '100%' : '40vh', opacity: 1 }} 
+                    animate={{ height: panelState === 'FULL' ? '100%' : '25vh', opacity: 1 }} 
                     exit={{ height: 0, opacity: 0 }} 
                     transition={{ duration: 0.3, ease: EASE }} 
                     className={`${panelState === 'FULL' ? 'flex-1' : 'flex-1 min-h-0'} w-full z-20 flex flex-col bg-black/40 border-t border-white/10 backdrop-blur-md`}

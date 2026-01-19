@@ -331,6 +331,22 @@ app.get('/api/user/status', (req, res) => {
   } catch (e) { return res.json({ isPremium: false }); }
 });
 
+// --- Reset Premium (for testing) ---
+app.get('/api/user/reset', (req, res) => {
+  try {
+    const id = Number(req.query.tg_id || req.query.id);
+    if (!id) {
+      // If no tg id provided, respond ok but no-op
+      return res.json({ ok: false, message: 'missing tg_id' });
+    }
+    // mark user as non-premium for testing
+    setUserPremium(id, false, null);
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.json({ ok: false });
+  }
+});
+
 async function runScannerJob() {
   if (scanInFlight) return;
   scanInFlight = true;
