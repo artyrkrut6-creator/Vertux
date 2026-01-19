@@ -32,17 +32,17 @@ const UI_INTERVAL = 300_000;
 const PRE_WORK_TIME = 45_000;
 const SILICON_KEY = process.env.SILICON_KEY || null;
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || null;
-const CRYPTO_BOT_TOKEN = process.env.CRYPTO_BOT_TOKEN || null;
 const WEBAPP_URL = process.env.WEBAPP_URL || 'https://vortex-ai-nffc.onrender.com';
 const MONGO_URI = process.env.MONGO_URI || null;
-const ADMIN_ID = 8270078362; // Твой ID
 const MANAGER_USERNAME = 'meanfive1'; 
+const ADMIN_ID = 8270078362;
 
 // --- STATE ---
 let scanInFlight = false;
 const activeSignals = new Map();
 const sseClients = new Set();
 const pendingVerifications = new Map();
+const lastDemoteReasonCounts = { lowPriceVol:0, spreadDepth:0, stddev:0, backtestError:0, backtestThreshold:0, directionalFail:0, insufficientKlines:0, sawtooth:0 };
 
 // --- HELPERS ---
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -107,6 +107,7 @@ function calculateRSI(closes, period=14) {
   return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
+// --- PATTERN DETECTION ---
 function detectPattern(klines) {
     if (klines.length < 5) return null;
     const input = {
@@ -128,9 +129,10 @@ function detectPattern(klines) {
 }
 
 // --- DEEPSEEK ---
-async function deepseekForecast5(symbol, contextCandles) {
+async function deepseekForecast5(symbol, contextCandles, patternName) {
   if (!SILICON_KEY) return null;
   const system = `You are Vortex AI. Your goal: Find a sniper entry point on MEXC.
+A technical pattern "${patternName || 'High Volatility'}" has been detected.
 TASK: Analyze 50 candles. Determine direction (LONG/SHORT). Calculate TARGET PRICE and STOP LOSS.
 JSON OUTPUT FORMAT: { "target_price": number, "stop_loss_price": number, "direction": "LONG"|"SHORT", "confidence": 0-100, "forecast_1m": [ ... ] }`;
   const user = `Symbol: ${symbol}. Last close: ${contextCandles[contextCandles.length-1].close}. Predict now.`;
@@ -160,12 +162,13 @@ JSON OUTPUT FORMAT: { "target_price": number, "stop_loss_price": number, "direct
   } catch (e) { return null; }
 }
 
-// --- PICKER ---
+// --- ADAPTIVE PICKER ---
 async function pickAiWithAdaptiveGates(aiPool) {
   const adaptiveSteps = [{ gates: { maxSpreadPct: 0.40, minDepth: 10_000, stddevMax: 0.25, backtestMean: 0.35 } }];
   const accepted = [];
   const pool = aiPool.slice().sort((a,b) => b.quoteVolume - a.quoteVolume).slice(0, 10);
   const blacklist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'USDCUSDT', 'FDUSDUSDT'];
+
   for (const step of adaptiveSteps) {
     const candidatesToCheck = [];
     for (const t of pool) {
@@ -179,7 +182,7 @@ async function pickAiWithAdaptiveGates(aiPool) {
             if (kl.length < 35) return null;
             const pattern = detectPattern(kl);
             if (!pattern) return null;
-            const ds = await deepseekForecast5(candidate.symbol, kl.map(k=>({close:Number(k[4])})));
+            const ds = await deepseekForecast5(candidate.symbol, kl.map(k=>({close:Number(k[4])})), pattern);
             if (!ds || ds.confidence < 75) return null;
             return { ...candidate, ...ds };
         } catch (e) { return null; }
@@ -190,28 +193,15 @@ async function pickAiWithAdaptiveGates(aiPool) {
   return accepted.slice(0, 2);
 }
 
-// --- DB ---
+// --- DB & USER ---
 if (MONGO_URI) {
   mongoose.connect(MONGO_URI).then(()=>console.log('[DB] Connected')).catch(e=>console.error('[DB] Error', e));
 }
-const UserSchema = new mongoose.Schema({ 
-    tgId: { type: String, unique: true }, 
-    isPremium: Boolean, 
-    expiresAt: Number, 
-    notificationsEnabled: { type: Boolean, default: true },
-    firstName: String,
-    username: String 
-});
+const UserSchema = new mongoose.Schema({ tgId: String, isPremium: Boolean, expiresAt: Number, notificationsEnabled: { type: Boolean, default: true }, firstName: String, username: String });
 const User = mongoose.models.User || mongoose.model('User', UserSchema);
 
-async function activateUser(id, name, username) {
-  try { 
-      await User.findOneAndUpdate(
-          { tgId: String(id) }, 
-          { isPremium: true, expiresAt: Date.now() + 30*24*3600000, firstName: name, username: username }, 
-          { upsert: true }
-      ); 
-  } catch(e){}
+async function activateUser(id) {
+  try { await User.findOneAndUpdate({ tgId: String(id) }, { isPremium: true, expiresAt: Date.now() + 30*24*3600000 }, { upsert: true }); } catch(e){}
 }
 async function checkUser(id) {
   try { const u = await User.findOne({ tgId: String(id) }); return u && u.isPremium && u.expiresAt > Date.now(); } catch(e){ return false; }
@@ -219,14 +209,13 @@ async function checkUser(id) {
 
 let notifyProUsers = async (message) => { console.log('[notifyProUsers] noop', message); };
 
-// --- TELEGRAM BOT (FULL V4) ---
+// --- TELEGRAM BOT (FULL V5) ---
 if (TG_BOT_TOKEN) {
     try {
         const bot = new Telegraf(TG_BOT_TOKEN);
 
         const mainMenu = Markup.keyboard([['🚀 Open App', '💎 Premium'], ['📊 Market', '⚙️ Settings']]).resize();
 
-        // Middleware: Save User Info
         bot.use(async (ctx, next) => {
             if (ctx.from) {
                 try {
@@ -247,66 +236,35 @@ if (TG_BOT_TOKEN) {
           } catch (e) { console.warn('Notify Error:', e); }
         };
 
-        bot.command('start', (ctx) => ctx.reply(`👋 Welcome, ${ctx.from.first_name}!`, mainMenu));
+        bot.command('start', async (ctx) => {
+            await ctx.reply(`👋 Welcome, ${ctx.from.first_name}!`, mainMenu);
+        });
 
         bot.command('admin', async (ctx) => {
             if (ctx.from.id !== ADMIN_ID) return;
             const count = await User.countDocuments();
             const pros = await User.countDocuments({ isPremium: true });
-            ctx.reply(`👑 **ADMIN PANEL**\n\n👥 Total Users: ${count}\n💎 PRO Users: ${pros}\n\nCommands:\n/give <id>\n/del <id>\n/list`);
-        });
-
-        bot.command('list', async (ctx) => {
-            if (ctx.from.id !== ADMIN_ID) return;
-            const users = await User.find().sort({_id:-1}).limit(10);
-            let text = '👥 **Last 10 Users:**\n';
-            users.forEach(u => text += `${u.firstName} (@${u.username}) - ${u.isPremium ? 'PRO' : 'FREE'} [${u.tgId}]\n`);
-            ctx.reply(text);
+            ctx.reply(`👑 **ADMIN PANEL**\n\n👥 Total Users: ${count}\n💎 PRO Users: ${pros}\n\nCommands:\n/give <id>\n/del <id>`);
         });
 
         bot.command('give', async (ctx) => {
             if (ctx.from.id !== ADMIN_ID) return;
             const id = ctx.message.text.split(' ')[1];
-            if (id) {
-                await activateUser(id, 'AdminAdd', 'admin');
-                ctx.reply(`✅ Given PRO to ${id}`);
-                try { await bot.telegram.sendMessage(id, '🎁 **Admin gave you PRO access!** Restart app.'); } catch(e){}
-            }
-        });
-
-        bot.command('del', async (ctx) => {
-            if (ctx.from.id !== ADMIN_ID) return;
-            const id = ctx.message.text.split(' ')[1];
-            if (id) {
-                await User.findOneAndUpdate({ tgId: String(id) }, { isPremium: false });
-                ctx.reply(`❌ Removed PRO from ${id}`);
-            }
+            if (id) { await activateUser(id); ctx.reply(`✅ Given PRO to ${id}`); }
         });
 
         bot.hears('🚀 Open App', (ctx) => ctx.reply('Launch Terminal:', Markup.inlineKeyboard([Markup.button.webApp('📱 Open Vortex AI', WEBAPP_URL)])));
 
         bot.hears('📊 Market', async (ctx) => {
             const isPro = await checkUser(ctx.from.id);
-            if (!isPro) return ctx.reply('🔒 **Premium Feature.**\nBuy PRO to see market analysis.');
-            
+            if (!isPro) return ctx.reply('🔒 **Premium Feature.**');
             const msg = await ctx.reply('Scanning...');
             try {
                 const all = await fetch24hrTickers();
                 const btc = all?.find(x => x.symbol === 'BTCUSDT');
-                const eth = all?.find(x => x.symbol === 'ETHUSDT');
                 const top = all?.filter(x => x.symbol.endsWith('USDT') && Number(x.quoteVolume) > 5000000).sort((a,b) => Number(b.priceChangePercent) - Number(a.priceChangePercent)).slice(0, 3);
-                const low = all?.filter(x => x.symbol.endsWith('USDT') && Number(x.quoteVolume) > 1000000).sort((a,b) => Number(a.priceChangePercent) - Number(b.priceChangePercent)).slice(0, 3);
-                
-                let text = `📉 **MARKET INTELLIGENCE**\n\n`;
-                text += `🟠 **BTC:** $${Number(btc.lastPrice).toFixed(0)} (${Number(btc.priceChangePercent).toFixed(2)}%)\n`;
-                text += `🔵 **ETH:** $${Number(eth.lastPrice).toFixed(0)} (${Number(eth.priceChangePercent).toFixed(2)}%)\n\n`;
-                
-                text += `🚀 **Top Gainers:**\n`;
+                let text = `📉 **MARKET**\nBTC: $${Number(btc.lastPrice).toFixed(0)} (${Number(btc.priceChangePercent).toFixed(2)}%)\n\n🚀 **Top Movers:**\n`;
                 top.forEach(c => text += `• ${c.symbol.replace('USDT','')}: +${Number(c.priceChangePercent).toFixed(1)}%\n`);
-                
-                text += `\n🩸 **Top Losers:**\n`;
-                low.forEach(c => text += `• ${c.symbol.replace('USDT','')}: ${Number(c.priceChangePercent).toFixed(1)}%\n`);
-
                 ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, text, { parse_mode: 'Markdown' });
             } catch (e) { ctx.deleteMessage(msg.message_id); }
         });
@@ -330,36 +288,41 @@ if (TG_BOT_TOKEN) {
             const u = await checkUser(ctx.from.id);
             if (u) return ctx.reply('✅ You are PRO.');
             ctx.reply('💎 **VORTEX PRO**\nPrice: $10 / 1000 RUB.\n\nSelect payment:', Markup.inlineKeyboard([
-                [Markup.button.callback('💠 Оплата Криптой', 'pay_crypto')],
+                [Markup.button.callback('💠 Оплата Криптой', 'pay_manager')], // Redirect to Manager
                 [Markup.button.callback('⭐️ Telegram Stars', 'pay_stars')],
                 [Markup.button.callback('💳 Перевод на карту', 'pay_manager')]
             ]));
         });
 
-        bot.action('pay_crypto', async (ctx) => {
-            if (!CRYPTO_BOT_TOKEN) return ctx.reply('❌ Crypto Pay not configured. Use Manager.');
-            try {
-                const res = await fetch('https://pay.crypt.bot/api/createInvoice', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json', 'Crypto-Pay-API-Token': CRYPTO_BOT_TOKEN },
-                    body: JSON.stringify({ asset: 'USDT', amount: '10', description: 'Vortex PRO', payload: `${ctx.from.id}` })
-                });
-                const data = await res.json();
-                if (data.ok) ctx.reply('Pay here:', Markup.inlineKeyboard([Markup.button.url('👉 Pay USDT', data.result.pay_url)]));
-                else ctx.reply('Error creating invoice.');
-            } catch(e){ ctx.reply('Error.'); }
-        });
+        // 2. MANAGER PAYMENT (FIXED)
+        bot.action('pay_manager', (ctx) => {
+            const userId = ctx.from.id;
+            const messageText = encodeURIComponent("Привет.\n\nНужны реквизиты для оплаты переводом на карту.");
+            const managerLink = `https://t.me/${MANAGER_USERNAME}?text=${messageText}`;
 
-        bot.action('pay_manager', (ctx) => ctx.editMessageText('💳 **Manual Payment**\n\nContact manager.', Markup.inlineKeyboard([
-            [Markup.button.url('📩 Contact Manager', `https://t.me/${MANAGER_USERNAME}`)],
-            [Markup.button.callback('✅ I Paid', 'paid_manual')],
-            [Markup.button.callback('⬅️ Back', 'back_premium')]
-        ])));
+            ctx.editMessageText(
+                `💳 **Способ оплаты: Перевод на карту** 🇷🇺\n` +
+                `💰 **К оплате:** 1000 RUB\n` +
+                `🆔 **Ваш ID:** \`${userId}\`\n\n` +
+                `👋 Напиши менеджеру по кнопке ниже, он выдаст реквизиты.\n\n` +
+                `⚡️ **ПОСЛЕ ПЕРЕВОДА** — возвращайся сюда и жми кнопку **"✅ Я Оплатил"**. Затем отправляй скриншот.\n\n` +
+                `_Доступ выдаётся в течение 5 минут._`,
+                {
+                    parse_mode: 'Markdown',
+                    ...Markup.inlineKeyboard([
+                        [Markup.button.url('📩 Написать Менеджеру', managerLink)],
+                        [Markup.button.callback('✅ Я Оплатил', 'paid_manual')],
+                        [Markup.button.callback('🔙 Назад', 'back_premium')]
+                    ])
+                }
+            );
+        });
 
         bot.action('back_premium', (ctx) => ctx.deleteMessage());
 
         bot.action('paid_manual', async (ctx) => {
             await ctx.answerCbQuery();
-            await ctx.reply('📸 **Please send a screenshot.**');
+            await ctx.reply('📸 **Пожалуйста, отправьте скриншот оплаты сюда.**');
             pendingVerifications.set(ctx.from.id, true);
         });
 
@@ -367,7 +330,7 @@ if (TG_BOT_TOKEN) {
             if (pendingVerifications.get(ctx.from.id)) {
                 pendingVerifications.delete(ctx.from.id);
                 const photoId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-                await ctx.reply('⏳ Verifying...');
+                await ctx.reply('⏳ **Проверка...** Админ проверит платеж.');
                 await bot.telegram.sendPhoto(ADMIN_ID, photoId, {
                     caption: `💰 **Payment**\nUser: ${ctx.from.first_name} (ID: ${ctx.from.id})\n@${ctx.from.username}`,
                     ...Markup.inlineKeyboard([Markup.button.callback('✅ Approve', `approve_${ctx.from.id}`), Markup.button.callback('❌ Reject', `reject_${ctx.from.id}`)])
@@ -378,14 +341,14 @@ if (TG_BOT_TOKEN) {
         bot.action(/^approve_(\d+)$/, async (ctx) => {
             const userId = ctx.match[1];
             await activateUser(userId);
-            await bot.telegram.sendMessage(userId, '🎉 **Approved!** PRO Activated.');
-            ctx.editMessageCaption(ctx.callbackQuery.message.caption + '\n\n✅ APPROVED');
+            await bot.telegram.sendMessage(userId, '🎉 **Оплата принята!** PRO доступ активирован.\nПерезапустите приложение.');
+            ctx.editMessageCaption(ctx.callbackQuery.message.caption + '\n\n✅ ОДОБРЕНО');
         });
 
         bot.action(/^reject_(\d+)$/, async (ctx) => {
             const userId = ctx.match[1];
-            await bot.telegram.sendMessage(userId, '❌ **Rejected.**');
-            ctx.editMessageCaption(ctx.callbackQuery.message.caption + '\n\n❌ REJECTED');
+            await bot.telegram.sendMessage(userId, '❌ **Оплата отклонена.** Свяжитесь с поддержкой.');
+            ctx.editMessageCaption(ctx.callbackQuery.message.caption + '\n\n❌ ОТКЛОНЕНО');
         });
 
         bot.action('pay_stars', (ctx) => ctx.replyWithInvoice({ chat_id: ctx.from.id, title: 'PRO', description: '1 Month', payload: 'pro', provider_token: '', currency: 'XTR', prices: [{ label: '1 Month', amount: 500 }] }));
@@ -451,7 +414,7 @@ async function runScannerJob() {
         newPicks.forEach(p => {
             if (!activeSignals.has(p.symbol)) {
                 activeSignals.set(p.symbol, { ...p, tag: 'AI', detectedAt: Date.now(), status: 'ACTIVE', addedAt: Date.now() });
-                notifyProUsers(`🚨 NEW SIGNAL: ${p.symbol} ${p.direction}! Target: ${p.target_price}`);
+                notifyProUsers(`🚨 NEW SIGNAL: ${p.symbol} ${p.direction}!\nTarget: ${p.target_price}`);
             }
         });
     }
@@ -500,7 +463,7 @@ async function runScannerJob() {
   finally { scanInFlight = false; }
 }
 
-// --- SERVER ROUTES ---
+// --- SERVER START ---
 app.get('/api/user/status', async (req, res) => {
     const id = req.query.tg_id;
     const hasAccess = await checkUser(id);
