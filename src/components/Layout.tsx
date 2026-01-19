@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Maximize2, Minimize2, ExternalLink, ChevronLeft, LayoutPanelLeft, ArrowLeft } from 'lucide-react';
+import { Maximize2, Minimize2, ExternalLink, ChevronLeft, LayoutPanelLeft, ArrowLeft, Activity } from 'lucide-react';
 import Sidebar from './Sidebar';
 import ChartContainer from './ChartContainer';
 import ChartBottomPanel from './ChartBottomPanel';
@@ -14,6 +14,7 @@ const Layout: React.FC = () => {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [viewState, setViewState] = useState<'LIST' | 'CHART'>('LIST');
+  const [showPanel, setShowPanel] = useState(true);
 
   const coins = useScannerStore((s) => s.coins || []);
   const addDetectedCoin = useScannerStore((s) => s.addDetectedCoin);
@@ -136,16 +137,30 @@ const Layout: React.FC = () => {
               )}
 
               {viewState === 'CHART' && (
-                <motion.div key="chart" initial={{ x: 300, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: -300, opacity: 0 }} transition={{ duration: 0.28 }} className="absolute inset-0 z-50 bg-transparent">
+                <motion.div key="chart" initial={{ x: 300, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: -300, opacity: 0 }} transition={{ duration: 0.28 }} className="absolute inset-0 z-50 bg-transparent flex flex-col">
                   <div className="h-12 flex items-center px-3 bg-black/60 border-b border-white/5">
                      <button onClick={() => setViewState('LIST')} className="p-2 rounded-md bg-white/5 mr-3">
                         <ArrowLeft />
                      </button>
+                     <button onClick={() => setShowPanel(s => !s)} className={`p-2 rounded-md bg-white/5 mr-3 ${showPanel ? 'shadow-[0_0_12px_rgba(124,58,237,0.25)]' : ''}`} aria-pressed={showPanel}>
+                        <Activity />
+                     </button>
                      <div className="font-bold">{selected || 'BTCUSDT'}</div>
                   </div>
-                  <div className="absolute inset-0 top-12">
+                  <div className="flex-1 relative">
                     <ChartContainer symbol={selected ?? 'BTCUSDT'} />
                   </div>
+                  <AnimatePresence>
+                    {showPanel && (
+                      <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.22 }} className="z-40">
+                        <div className="bg-black/20 border-t border-white/5">
+                          <div className="p-2">
+                            <ChartBottomPanel coin={currentCoin} />
+                          </div>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
                 </motion.div>
               )}
             </AnimatePresence>
@@ -163,6 +178,9 @@ const Layout: React.FC = () => {
                       {isFullscreen ? <LayoutPanelLeft size={16} className="text-violet-400"/> : <Maximize2 size={16} className="text-gray-400"/>}
                       <span className="text-xs font-bold text-gray-300">{isFullscreen ? 'SHOW LIST' : 'EXPAND'}</span>
                     </button>
+                    <button onClick={() => setShowPanel(s => !s)} className={`p-2 rounded-md bg-white/5 ${showPanel ? 'shadow-[0_0_12px_rgba(124,58,237,0.25)]' : ''}`} aria-pressed={showPanel}>
+                      <Activity />
+                    </button>
                     <div className="h-6 w-[1px] bg-white/10 mx-2" />
                     <span className="font-bold text-lg tracking-tight text-white/90">{selected || 'BTCUSDT'}</span>
                  </div>
@@ -176,11 +194,17 @@ const Layout: React.FC = () => {
                 <ChartContainer symbol={selected ?? 'BTCUSDT'} />
               </div>
 
-              <div className="flex-shrink-0 w-full z-20 bg-black/20 border-t border-white/5 backdrop-blur-md">
-                 <div className="p-2">
-                   <ChartBottomPanel coin={currentCoin} />
-                 </div>
-              </div>
+              <AnimatePresence>
+                {showPanel && (
+                  <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.22 }} className="flex-shrink-0 w-full z-20">
+                     <div className="bg-black/20 border-t border-white/5 backdrop-blur-md">
+                        <div className="p-2">
+                          <ChartBottomPanel coin={currentCoin} />
+                        </div>
+                     </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </main>
           </>
         )}
