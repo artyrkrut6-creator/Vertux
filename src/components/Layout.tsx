@@ -4,6 +4,7 @@ import { Maximize2, Minimize2, ExternalLink, ChevronLeft, LayoutPanelLeft } from
 import Sidebar from './Sidebar';
 import ChartContainer from './ChartContainer';
 import ChartBottomPanel from './ChartBottomPanel';
+import SmartSearchButton from './SmartSearchButton';
 import useScannerStore, { DetectedCoin } from '../store/scannerStore';
 
 const EASE = [0.4, 0, 0.2, 1];
@@ -15,9 +16,24 @@ const Layout: React.FC = () => {
 
   const coins = useScannerStore((s) => s.coins || []);
   const addDetectedCoin = useScannerStore((s) => s.addDetectedCoin);
-  const removeCoin = useScannerStore((s) => s.removeCoin);
   const setNextScanAt = useScannerStore((s) => s.setNextScanAt);
   const setPremium = useScannerStore((s) => s.setPremium);
+
+  // Auth Check (Telegram)
+  useEffect(() => {
+    // @ts-ignore
+    const tg = window.Telegram?.WebApp;
+    if (tg) {
+        tg.ready();
+        const user = tg.initDataUnsafe?.user;
+        if (user) {
+            fetch(`/api/user/status?tg_id=${user.id}`)
+                .then(r => r.json())
+                .then(data => setPremium(!!data.isPremium))
+                .catch(() => setPremium(false));
+        }
+    }
+  }, [setPremium]);
 
   const preferred = useMemo(() => {
     const ai = coins.find((c) => c.tag === 'AI');
@@ -25,18 +41,6 @@ const Layout: React.FC = () => {
   }, [coins]);
 
   useEffect(() => {
-    try {
-      const tg = (window as any).Telegram?.WebApp;
-      if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) {
-        const id = tg.initDataUnsafe.user.id;
-        fetch(`/api/user/status?tg_id=${id}`).then(r => r.json()).then(j => {
-          setPremium(!!(j && j.isPremium));
-        }).catch(() => setPremium(false));
-      } else {
-        setPremium(false);
-      }
-    } catch (e) { setPremium(false); }
-  }, [setPremium]);
     if (preferred && !selected) setSelected(preferred);
   }, [preferred, selected]);
 
@@ -47,9 +51,11 @@ const Layout: React.FC = () => {
     return () => window.removeEventListener('resize', checkMobile);
   }, []);
 
+  // SSE
   useEffect(() => {
     let es: EventSource | null = null;
     let alive = true;
+
     const ingest = (payload: any) => {
       try { if (payload && payload.nextScanAt) setNextScanAt(Number(payload.nextScanAt)); } catch (_) {}
       const parsed = payload?.parsed || payload;
@@ -70,16 +76,23 @@ const Layout: React.FC = () => {
           rsi: item.rsi !== undefined ? Number(item.rsi) : undefined,
           signal: item.signal !== undefined ? item.signal : undefined,
           spreadPct: item.spreadPct,
-          depthUSDT: item.depthUSDT
+          depthUSDT: item.depthUSDT,
+          status: item.status
         };
         addDetectedCoin(coin);
       }
     };
+
     (async () => {
       try {
         const r = await fetch('/api/scheduler/latest');
-        if (r.ok) { const j = await r.json(); if (alive) ingest(j); }
+        if (r.ok) {
+          const j = await r.json();
+          if (!alive) return;
+          ingest(j);
+        }
       } catch (_) {}
+
       try {
         es = new EventSource('/events');
         es.addEventListener('open', () => console.log('[Layout] SSE open'));
@@ -88,25 +101,13 @@ const Layout: React.FC = () => {
         });
       } catch (_) {}
     })();
+
     return () => { alive = false; try { es?.close(); } catch (_) {} };
   }, [addDetectedCoin, setNextScanAt]);
 
   const handleSelect = (s: string) => {
     setSelected(s);
     if (isMobile) setIsFullscreen(true);
-  };
-
-  const handleSignalResolved = (sym: string) => {
-    try {
-      removeCoin(sym);
-      // pick next available coin
-      const next = coins.find(c => String(c.symbol).toUpperCase() !== String(sym).toUpperCase());
-      if (next) setSelected(next.symbol);
-      else setSelected(undefined);
-
-      // fire-and-forget notify (optional)
-      try { fetch(`/api/signal/resolved?symbol=${encodeURIComponent(sym)}`, { method: 'POST' }); } catch (_) {}
-    } catch (_) {}
   };
 
   const tradeLink = `https://www.mexc.com/exchange/${(selected || 'BTCUSDT').replace('USDT', '_USDT')}`;
@@ -120,6 +121,7 @@ const Layout: React.FC = () => {
       </div>
 
       <div className="flex-1 flex w-full h-full relative z-10 p-2 gap-2 overflow-hidden">
+
         <AnimatePresence mode="popLayout">
           {(!isFullscreen || !isMobile) && !isFullscreen && (
             <motion.aside
@@ -160,20 +162,8 @@ const Layout: React.FC = () => {
              </a>
           </div>
 
-          <div className="flex-1 min-h-0 w-full relative z-10 overflow-hidden">
-             {/* Animation Wrapper HERE */}
-             <AnimatePresence mode="wait">
-               <motion.div
-                 key={selected}
-                 initial={{ opacity: 0, scale: 0.98, filter: "blur(4px)" }}
-                 animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
-                 exit={{ opacity: 0, scale: 0.98, filter: "blur(4px)" }}
-                 transition={{ duration: 0.25 }}
-                 className="w-full h-full"
-               >
-                 <ChartContainer symbol={selected ?? 'BTCUSDT'} onSignalResolved={handleSignalResolved} />
-               </motion.div>
-             </AnimatePresence>
+          <div className="flex-1 min-h-0 w-full relative z-10">
+             <ChartContainer symbol={selected ?? 'BTCUSDT'} />
           </div>
 
           <div className="flex-shrink-0 w-full z-20 bg-black/20 border-t border-white/5 backdrop-blur-md">
@@ -181,8 +171,12 @@ const Layout: React.FC = () => {
                <ChartBottomPanel coin={currentCoin} />
              </div>
           </div>
+
         </motion.main>
+
       </div>
+      
+      {!isFullscreen && <SmartSearchButton onSelect={handleSelect} />}
     </div>
   );
 };
