@@ -1,10 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Maximize2, Minimize2, ExternalLink, ChevronLeft, LayoutPanelLeft } from 'lucide-react';
+import { Maximize2, Minimize2, ExternalLink, ChevronLeft, LayoutPanelLeft, ArrowLeft } from 'lucide-react';
 import Sidebar from './Sidebar';
 import ChartContainer from './ChartContainer';
 import ChartBottomPanel from './ChartBottomPanel';
-import SmartSearchButton from './SmartSearchButton';
+// SmartSearchButton removed for mobile-first build
 import useScannerStore, { DetectedCoin } from '../store/scannerStore';
 
 const EASE = [0.4, 0, 0.2, 1];
@@ -13,6 +13,7 @@ const Layout: React.FC = () => {
   const [selected, setSelected] = useState<string | undefined>('BTCUSDT');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
+  const [viewState, setViewState] = useState<'LIST' | 'CHART'>('LIST');
 
   const coins = useScannerStore((s) => s.coins || []);
   const addDetectedCoin = useScannerStore((s) => s.addDetectedCoin);
@@ -50,6 +51,10 @@ const Layout: React.FC = () => {
     window.addEventListener('resize', checkMobile);
     return () => window.removeEventListener('resize', checkMobile);
   }, []);
+
+  useEffect(() => {
+    if (!isMobile) setViewState('LIST');
+  }, [isMobile]);
 
   // SSE
   useEffect(() => {
@@ -107,7 +112,7 @@ const Layout: React.FC = () => {
 
   const handleSelect = (s: string) => {
     setSelected(s);
-    if (isMobile) setIsFullscreen(true);
+    if (isMobile) setViewState('CHART');
   };
 
   const tradeLink = `https://www.mexc.com/exchange/${(selected || 'BTCUSDT').replace('USDT', '_USDT')}`;
@@ -120,63 +125,66 @@ const Layout: React.FC = () => {
          <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-blue-900/10 blur-[120px] rounded-full" />
       </div>
 
-      <div className="flex-1 flex w-full h-full relative z-10 p-2 gap-2 overflow-hidden">
+      <div className="flex-1 flex w-full h-full relative z-10 gap-2 overflow-hidden">
+        {isMobile ? (
+          <div className="w-full h-full relative">
+            <AnimatePresence initial={false} mode="popLayout">
+              {viewState === 'LIST' && (
+                <motion.div key="list" initial={{ x: 300, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: -300, opacity: 0 }} transition={{ duration: 0.28 }} className="absolute inset-0 z-40">
+                  <Sidebar onSelect={(s) => handleSelect(s)} selected={selected} />
+                </motion.div>
+              )}
 
-        <AnimatePresence mode="popLayout">
-          {(!isFullscreen || !isMobile) && !isFullscreen && (
-            <motion.aside
-              initial={{ width: 0, opacity: 0, x: -20 }}
-              animate={{ width: isMobile ? '100%' : 360, opacity: 1, x: 0 }}
-              exit={{ width: 0, opacity: 0, x: -20 }}
-              transition={{ duration: 0.42, ease: EASE }}
-              className={`h-full flex flex-col ${isMobile ? 'w-full absolute inset-0 z-50 bg-[#050505]' : 'relative'}`}
-            >
-               <Sidebar onSelect={handleSelect} selected={selected} />
-            </motion.aside>
-          )}
-        </AnimatePresence>
-
-        <motion.main 
-          layout
-          className="flex-1 flex flex-col h-full min-w-0 bg-white/5 border border-white/10 rounded-2xl backdrop-blur-xl shadow-2xl relative overflow-hidden"
-        >
-          <div className="h-14 flex-shrink-0 border-b border-white/5 flex items-center justify-between px-4 bg-black/20 z-30 relative">
-             <div className="flex items-center gap-2">
-                {isMobile && (
-                  <button onClick={() => setIsFullscreen(false)} className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-gray-400">
-                    <ChevronLeft size={20} />
-                  </button>
-                )}
-                {!isMobile && (
-                  <button onClick={() => setIsFullscreen(!isFullscreen)} className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/5 transition-all group">
-                    {isFullscreen ? <LayoutPanelLeft size={16} className="text-violet-400 group-hover:scale-110 transition-transform"/> : <Maximize2 size={16} className="text-gray-400"/>}
-                    <span className="text-xs font-bold text-gray-300">{isFullscreen ? 'SHOW LIST' : 'EXPAND'}</span>
-                  </button>
-                )}
-                <div className="h-6 w-[1px] bg-white/10 mx-2" />
-                <span className="font-bold text-lg tracking-tight text-white/90">{selected || 'BTCUSDT'}</span>
-             </div>
-             <a href={tradeLink} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 px-4 py-1.5 bg-gradient-to-r from-violet-600 to-indigo-600 rounded-lg shadow-lg shadow-violet-500/20 hover:shadow-violet-500/40 hover:scale-105 active:scale-95 transition-all group">
-               <span className="text-xs font-bold tracking-wide">TRADE</span>
-               <ExternalLink size={14} className="group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
-             </a>
+              {viewState === 'CHART' && (
+                <motion.div key="chart" initial={{ x: 300, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: -300, opacity: 0 }} transition={{ duration: 0.28 }} className="absolute inset-0 z-50 bg-transparent">
+                  <div className="h-12 flex items-center px-3 bg-black/60 border-b border-white/5">
+                     <button onClick={() => setViewState('LIST')} className="p-2 rounded-md bg-white/5 mr-3">
+                        <ArrowLeft />
+                     </button>
+                     <div className="font-bold">{selected || 'BTCUSDT'}</div>
+                  </div>
+                  <div className="absolute inset-0 top-12">
+                    <ChartContainer symbol={selected ?? 'BTCUSDT'} />
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
+        ) : (
+          <>
+            <aside className="w-[360px] h-full">
+              <Sidebar onSelect={(s) => handleSelect(s)} selected={selected} />
+            </aside>
 
-          <div className="flex-1 min-h-0 w-full relative z-10">
-             <ChartContainer symbol={selected ?? 'BTCUSDT'} />
-          </div>
+            <main className="flex-1 flex flex-col h-full min-w-0 bg-white/5 border border-white/10 rounded-2xl backdrop-blur-xl shadow-2xl relative overflow-hidden">
+              <div className="h-14 flex-shrink-0 border-b border-white/5 flex items-center justify-between px-4 bg-black/20 z-30 relative">
+                 <div className="flex items-center gap-2">
+                    <button onClick={() => setIsFullscreen(!isFullscreen)} className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/5 transition-all group">
+                      {isFullscreen ? <LayoutPanelLeft size={16} className="text-violet-400"/> : <Maximize2 size={16} className="text-gray-400"/>}
+                      <span className="text-xs font-bold text-gray-300">{isFullscreen ? 'SHOW LIST' : 'EXPAND'}</span>
+                    </button>
+                    <div className="h-6 w-[1px] bg-white/10 mx-2" />
+                    <span className="font-bold text-lg tracking-tight text-white/90">{selected || 'BTCUSDT'}</span>
+                 </div>
+                 <a href={tradeLink} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 px-4 py-1.5 bg-gradient-to-r from-violet-600 to-indigo-600 rounded-lg shadow-lg shadow-violet-500/20 hover:shadow-violet-500/40 hover:scale-105 active:scale-95 transition-all group">
+                   <span className="text-xs font-bold tracking-wide">TRADE</span>
+                   <ExternalLink size={14} />
+                 </a>
+              </div>
 
-          <div className="flex-shrink-0 w-full z-20 bg-black/20 border-t border-white/5 backdrop-blur-md">
-             <div className="p-2">
-               <ChartBottomPanel coin={currentCoin} />
-             </div>
-          </div>
+              <div className="flex-1 min-h-0 w-full relative z-10">
+                <ChartContainer symbol={selected ?? 'BTCUSDT'} />
+              </div>
 
-        </motion.main>
-
+              <div className="flex-shrink-0 w-full z-20 bg-black/20 border-t border-white/5 backdrop-blur-md">
+                 <div className="p-2">
+                   <ChartBottomPanel coin={currentCoin} />
+                 </div>
+              </div>
+            </main>
+          </>
+        )}
       </div>
-      
-      {!isFullscreen && <SmartSearchButton onSelect={handleSelect} />}
     </div>
   );
 };

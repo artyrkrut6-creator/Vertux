@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import useScannerStore from '../store/scannerStore';
-import { Flame, Clock, Filter, X, Check, BarChart3, ScanLine, Search } from 'lucide-react';
+import logoSrc from '/nonfon.png';
+import { Flame, Clock, Filter, X, Check, BarChart3, ScanLine, Search, CheckCircle, XCircle, Lock } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 interface Props {
@@ -44,6 +45,8 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
   }));
 
   const [now, setNow] = useState(Date.now());
+  const [isMobile, setIsMobile] = useState(false);
+  const [logoBroken, setLogoBroken] = useState(false);
   const [filterOpen, setFilterOpen] = useState(false);
   const [activeFilter, setActiveFilter] = useState<'ALL' | 'AI' | 'LONG' | 'SHORT'>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
@@ -52,6 +55,16 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
+
+  useEffect(() => {
+    const checkMobile = () => setIsMobile(window.innerWidth < 768);
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
+
+  const containerClass = isMobile ? 'w-full h-full flex flex-col p-0' : 'w-[360px] h-full flex flex-col p-2';
+  const panelClass = isMobile ? 'flex-1 bg-black/90 overflow-hidden flex flex-col relative' : 'flex-1 rounded-2xl border border-white/10 bg-white/5 backdrop-blur-xl overflow-hidden flex flex-col shadow-2xl relative';
 
   const sorted = useMemo(() => {
     const q = String(searchQuery || '').trim().toUpperCase();
@@ -75,8 +88,8 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
   const scanProgress = Math.min(100, Math.max(0, (1 - timeToNextScan / 300000) * 100));
 
   return (
-    <aside className="w-[360px] h-full flex flex-col p-2">
-      <div className="flex-1 rounded-2xl border border-white/10 bg-white/5 backdrop-blur-xl overflow-hidden flex flex-col shadow-2xl relative">
+    <aside className={containerClass}>
+      <div className={panelClass}>
         
         {/* --- HEADER --- */}
         <div className="p-4 border-b border-white/10 bg-black/40 flex justify-between items-center z-20">
@@ -84,7 +97,11 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
             {/* Logo Image */}
             <div className="relative w-10 h-10">
                <div className="absolute inset-0 bg-violet-500 blur-xl opacity-40 rounded-full"></div>
-               <img src="/nonfon.png" alt="Vortex Logo" className="relative w-full h-full object-contain drop-shadow-[0_0_5px_rgba(139,92,246,0.5)]" />
+               {!logoBroken ? (
+                 <img src={logoSrc} alt="Vortex Logo" onError={() => setLogoBroken(true)} className="relative w-full h-full object-contain drop-shadow-[0_0_5px_rgba(139,92,246,0.5)]" />
+               ) : (
+                 <div className="w-full h-full flex items-center justify-center text-white font-bold">V</div>
+               )}
             </div>
             
             {/* Brand Text */}
@@ -163,18 +180,18 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
         </div>
 
         {/* --- COIN LIST --- */}
-        <div className="flex-1 overflow-y-auto p-2 space-y-2 custom-scrollbar relative">
+        <div className={`flex-1 overflow-y-auto ${isMobile ? 'p-3' : 'p-2'} space-y-2 custom-scrollbar relative`}>
           <AnimatePresence mode="popLayout" initial={false}>
             {sorted.map((c, index) => {
                 const isAI = c.tag === 'AI';
-                const detectedAt = c.detectedAt || c.addedAt || Date.now();
+                const detectedAt = c.detectedAt || (c as any).addedAt || Date.now();
                 const activeMs = Math.max(0, now - detectedAt);
 
               let badge = null;
               if (c.status === 'WON') {
-                badge = <span className="bg-green-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#16a34a] font-bold">WIN</span>;
+                badge = <span className="bg-green-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#16a34a] font-bold flex items-center gap-1"><CheckCircle size={10}/> WIN</span>;
               } else if (c.status === 'LOST') {
-                badge = <span className="bg-red-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#dc2626] font-bold">LOSS</span>;
+                badge = <span className="bg-red-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#dc2626] font-bold flex items-center gap-1"><XCircle size={10}/> LOSS</span>;
               } else if (isAI) {
                 badge = <span className="bg-violet-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#7c3aed] font-bold">AI SNIPER</span>;
               } else if (c.signal === 'LONG') {
@@ -197,12 +214,11 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
                   animate={{ opacity: 1, x: 0 }}
                   exit={{ opacity: 0, scale: 0.95, transition: { duration: 0.15 } }}
                   transition={{ duration: 0.2 }}
-                  onClick={() => onSelect(c.symbol)}
+                  onClick={() => !isLocked && onSelect(c.symbol)}
                   className={`
-                    relative p-3 rounded-xl border transition-colors cursor-pointer overflow-hidden group
-                    ${isSelected 
-                      ? 'bg-white/10 border-violet-500/50 shadow-[0_0_15px_rgba(139,92,246,0.2)]' 
-                      : 'bg-white/5 border-white/5 hover:bg-white/10 hover:border-white/20'}
+                    relative transition-colors cursor-pointer overflow-hidden group 
+                    ${isMobile ? 'py-4 px-3' : 'p-3 rounded-xl border'} 
+                    ${isSelected ? 'bg-white/10 border-violet-500/50 shadow-[0_0_15px_rgba(139,92,246,0.2)]' : 'bg-white/5 border-white/5 hover:bg-white/10 hover:border-white/20'} 
                     ${isLocked ? 'blur-md opacity-50 pointer-events-none select-none grayscale' : ''}
                   `}
                 >
@@ -251,7 +267,7 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
             <div className="absolute bottom-0 left-0 w-full h-2/3 bg-gradient-to-t from-black via-black/80 to-transparent flex flex-col items-center justify-end pb-10 z-50 pointer-events-auto">
                <div className="bg-white/10 backdrop-blur-xl border border-white/20 p-4 rounded-2xl shadow-2xl flex flex-col items-center gap-3 w-3/4">
                   <div className="w-10 h-10 bg-violet-600 rounded-full flex items-center justify-center shadow-[0_0_15px_#7c3aed] animate-pulse">
-                     <span className="text-white font-bold">🔒</span>
+                     <Lock size={20} className="text-white" />
                   </div>
                   <div className="text-center">
                      <h3 className="text-white font-bold text-sm">PRO ACCESS LOCKED</h3>
@@ -281,7 +297,7 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
           )}
         </div>
 
-        {/* --- FOOTER --- */}
+        {/* --- FOOTER: NEXT SCAN TIMER --- */}
         <div className="p-3 bg-black/60 border-t border-white/10 text-center relative overflow-hidden">
           {isScanning ? (
             <div className="text-yellow-400 text-xs font-bold animate-pulse flex justify-center items-center gap-2 relative z-10">
