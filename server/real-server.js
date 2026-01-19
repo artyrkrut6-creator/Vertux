@@ -207,26 +207,41 @@ async function checkUser(id) {
 if (TG_BOT_TOKEN) {
     try {
         const bot = new Telegraf(TG_BOT_TOKEN);
-        bot.command('start', async (ctx) => {
-          try {
+        
+        bot.start(async (ctx) => {
             const uid = ctx.from?.id;
-            // Ensure DB connected before touching user records
-            if (mongoose.connection && mongoose.connection.readyState !== 1) {
-              try { await ctx.reply('System initializing, please wait...'); } catch(_){}
-              return;
-            }
-
-            await ctx.reply('Welcome to Vortex AI! Use the buttons below to open the WebApp or buy PRO.', Markup.inlineKeyboard([
-              Markup.button.webApp('🚀 Launch Vortex AI', WEBAPP_URL),
-              Markup.button.callback('💎 Buy PRO', 'buy')
-            ]));
-          } catch (e) {
-            console.error('Bot Start Error:', e);
-            try { await ctx.reply('Error starting bot'); } catch(_){}
-          }
+            // DO NOT DEACTIVATE ON START
+            try {
+                await ctx.reply('Welcome to Vortex AI! 🚀', Markup.inlineKeyboard([
+                    Markup.button.webApp('📱 Launch App', WEBAPP_URL),
+                    Markup.button.callback('💎 Buy Premium', 'buy')
+                ]));
+            } catch(e) { console.error('Bot Start:', e); }
         });
-        bot.launch().catch(()=>{});
-    } catch(e){}
+
+        bot.action('buy', async (ctx) => {
+            try {
+                await ctx.answerCbQuery();
+                await ctx.reply('Price: 1000 RUB. Click below when paid.', Markup.inlineKeyboard([Markup.button.callback('✅ I Paid', 'paid')]));
+            } catch(e){}
+        });
+
+        bot.action('paid', async (ctx) => {
+            try {
+                await ctx.answerCbQuery();
+                const uid = ctx.from?.id;
+                if (uid) {
+                    await activateUser(uid);
+                    await ctx.reply('✅ Premium Activated! Restart the app.');
+                }
+            } catch(e){}
+        });
+
+        bot.launch().catch(e => console.error('Bot Launch Error:', e));
+        
+        process.once('SIGINT', () => bot.stop('SIGINT'));
+        process.once('SIGTERM', () => bot.stop('SIGTERM'));
+    } catch(e) { console.error('Bot Init Error:', e); }
 }
 
 // --- SCANNER JOB ---
@@ -327,7 +342,7 @@ async function runScannerJob() {
   finally { scanInFlight = false; }
 }
 
-// --- SERVER START ---
+// --- ROUTES ---
 app.get('/api/user/status', async (req, res) => {
     const id = req.query.tg_id;
     const hasAccess = await checkUser(id);
@@ -355,7 +370,7 @@ app.get('/api/scheduler/latest', (req, res) => {
     if (fs.existsSync(DATA_FILE)) res.json(JSON.parse(fs.readFileSync(DATA_FILE))); else res.json({});
 });
 
-// Serve frontend
+// Front-end serve
 app.use(express.static(path.join(__dirname, '../dist')));
 app.get('*', (req, res) => {
     if (req.path.startsWith('/api') || req.path.startsWith('/events')) return;
