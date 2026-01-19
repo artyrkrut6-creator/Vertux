@@ -207,9 +207,24 @@ async function checkUser(id) {
 if (TG_BOT_TOKEN) {
     try {
         const bot = new Telegraf(TG_BOT_TOKEN);
-        bot.command('start', (ctx) => ctx.reply('Welcome! Use the app.', Markup.inlineKeyboard([Markup.button.webApp('Launch', WEBAPP_URL), Markup.button.callback('Buy PRO', 'buy')])));
-        bot.action('buy', (ctx) => ctx.reply('Price: 1000 RUB. Click Paid.', Markup.inlineKeyboard([Markup.button.callback('I Paid', 'paid')])));
-        bot.action('paid', (ctx) => { activateUser(ctx.from.id); ctx.reply('Activated!'); });
+        bot.command('start', async (ctx) => {
+          try {
+            const uid = ctx.from?.id;
+            // Ensure DB connected before touching user records
+            if (mongoose.connection && mongoose.connection.readyState !== 1) {
+              try { await ctx.reply('System initializing, please wait...'); } catch(_){}
+              return;
+            }
+
+            await ctx.reply('Welcome to Vortex AI! Use the buttons below to open the WebApp or buy PRO.', Markup.inlineKeyboard([
+              Markup.button.webApp('🚀 Launch Vortex AI', WEBAPP_URL),
+              Markup.button.callback('💎 Buy PRO', 'buy')
+            ]));
+          } catch (e) {
+            console.error('Bot Start Error:', e);
+            try { await ctx.reply('Error starting bot'); } catch(_){}
+          }
+        });
         bot.launch().catch(()=>{});
     } catch(e){}
 }
