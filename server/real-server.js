@@ -5,6 +5,8 @@ const fs = require('fs');
 const path = require('path');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { BullishEngulfing, BearishEngulfing, Hammer, ShootingStar, Doji, BollingerBands } = require('technicalindicators');
+const mongoose = require('mongoose');
+const { Telegraf, Markup } = require('telegraf');
 
 const PORT = Number(process.env.PORT || 5176);
 const app = express();
@@ -24,25 +26,20 @@ const MIN_PRICE_FT = 0.02;
 const MIN_PRICE_AI = 0.10;
 const MIN_QUOTEVOL_FT = 700_000;
 const MIN_QUOTEVOL_AI = 2_500_000;
-const MAX_SPREAD_FT_PCT = 0.50;
-const MAX_SPREAD_AI_PCT = 0.20;
-const DEPTH_BAND_PCT = 0.20; 
-const MIN_DEPTH_FT_USDT = 10_000;
-const MIN_DEPTH_AI_USDT = 15_000;
 const BACKTEST_KLINES = 40;
 const CHUNK_SIZE = 20; 
 const UI_INTERVAL = 300_000; 
 const PRE_WORK_TIME = 45_000;
 const SILICON_KEY = process.env.SILICON_KEY || null;
+const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || null;
+const WEBAPP_URL = process.env.WEBAPP_URL || 'https://vortex-ai-nffc.onrender.com';
+const MONGO_URI = process.env.MONGO_URI || null;
 
 // --- STATE ---
 let scanInFlight = false;
-let lastRunTs = null;
-let lastAiPickCount = 0;
-const forecastSourceBySymbol = {};
-const lastDemoteReasonCounts = { lowPriceVol:0, spreadDepth:0, stddev:0, backtestError:0, backtestThreshold:0, directionalFail:0, insufficientKlines:0, sawtooth:0 };
 const activeSignals = new Map();
 const sseClients = new Set();
+const lastDemoteReasonCounts = { lowPriceVol:0, spreadDepth:0, stddev:0, backtestError:0, backtestThreshold:0, directionalFail:0, insufficientKlines:0, sawtooth:0 };
 
 // --- HELPERS ---
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -86,8 +83,7 @@ function relStdDevPct(closes) {
   if (!closes.length) return 999;
   const mean = closes.reduce((s,v)=>s+v,0)/closes.length;
   if (!mean) return 999;
-  const variance = closes.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / closes.length;
-  return (Math.sqrt(variance) / mean) * 100;
+  return (Math.sqrt(closes.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / closes.length) / mean) * 100;
 }
 
 function calculateRSI(closes, period=14) {
@@ -105,8 +101,7 @@ function calculateRSI(closes, period=14) {
     avgLoss = (avgLoss * (period - 1) + (change < 0 ? -change : 0)) / period;
   }
   if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
+  return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
 // --- PATTERN DETECTION ---
@@ -118,17 +113,14 @@ function detectPattern(klines) {
         low: klines.map(k=>Number(k[3])),
         close: klines.map(k=>Number(k[4])),
     };
-    
     if (BullishEngulfing.hasPattern(input)) return "Bullish Engulfing";
     if (BearishEngulfing.hasPattern(input)) return "Bearish Engulfing";
     if (Hammer.hasPattern(input)) return "Hammer";
     if (ShootingStar.hasPattern(input)) return "Shooting Star";
-
     const bb = BollingerBands.calculate({period: 20, stdDev: 2, values: input.close});
     if (bb.length > 0) {
         const last = bb[bb.length-1];
-        const width = (last.upper - last.lower) / (last.middle || 1);
-        if (width < 0.015) return "Bollinger Squeeze";
+        if ((last.upper - last.lower) / (last.middle || 1) < 0.015) return "Bollinger Squeeze";
     }
     return null;
 }
@@ -136,31 +128,13 @@ function detectPattern(klines) {
 // --- DEEPSEEK ---
 async function deepseekForecast5(symbol, contextCandles, patternName) {
   if (!SILICON_KEY) return null;
-
   const system = `You are Vortex AI. Your goal: Find a sniper entry point on MEXC.
 A technical pattern "${patternName || 'High Volatility'}" has been detected.
-
-**TASK:**
-1. Analyze 50 candles (1m).
-2. Determine direction (LONG/SHORT) based on Market Structure.
-3. Calculate TARGET PRICE (Nearest support/resistance in 5 mins).
-4. Calculate STOP LOSS.
-
-**JSON OUTPUT FORMAT:**
-{
-  "target_price": <number>,
-  "stop_loss_price": <number>,
-  "direction": "LONG" | "SHORT",
-  "confidence": <number 0-100>,
-  "reasoning": "string",
-  "forecast_1m": [ ...5 candles... ]
-}`;
-
-  const user = `Symbol: ${symbol}. Last close: ${contextCandles[contextCandles.length-1].close}. Recent 30m closes: ${contextCandles.map(c=>c.close).join(',')}. Predict now.`;
-
+TASK: Analyze 50 candles. Determine direction (LONG/SHORT). Calculate TARGET PRICE and STOP LOSS.
+JSON OUTPUT FORMAT: { "target_price": number, "stop_loss_price": number, "direction": "LONG"|"SHORT", "confidence": 0-100, "forecast_1m": [ ... ] }`;
+  const user = `Symbol: ${symbol}. Last close: ${contextCandles[contextCandles.length-1].close}. Predict now.`;
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), 25000); 
-
   try {
     const r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
       method: 'POST', headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
@@ -169,16 +143,13 @@ A technical pattern "${patternName || 'High Volatility'}" has been detected.
     });
     clearTimeout(id);
     if (!r.ok) return null;
-
     const j = await r.json();
     let content = j?.choices?.[0]?.message?.content || '{}';
     if (content.includes('```json')) content = content.split('```json')[1].split('```')[0].trim();
     const parsed = JSON.parse(content);
     if (!parsed.target_price) return null;
-
-    const now = Date.now();
     return {
-        candles: parsed.forecast_1m.map((c, i) => ({ t: now + (i+1)*60000, close: Number(c.close) })),
+        candles: parsed.forecast_1m.map((c, i) => ({ t: Date.now() + (i+1)*60000, close: Number(c.close) })),
         target_price: Number(parsed.target_price),
         stop_loss_price: Number(parsed.stop_loss_price),
         direction: parsed.direction,
@@ -202,36 +173,54 @@ async function pickAiWithAdaptiveGates(aiPool) {
         if (t.quoteVolume < MIN_QUOTEVOL_AI) continue;
         candidatesToCheck.push(t);
     }
-
     const results = await Promise.all(candidatesToCheck.slice(0, 5).map(async (candidate) => {
         try {
             const kl = await fetchMexcKlines(candidate.symbol, '1m', 35);
             if (kl.length < 35) return null;
-            
-            // PATTERN DETECTION
             const pattern = detectPattern(kl);
-            if (!pattern) return null; // No pattern -> No AI
-
-            const ctx = kl.map(k=>({close:Number(k[4])}));
-            const ds = await deepseekForecast5(candidate.symbol, ctx, pattern);
+            if (!pattern) return null;
+            const ds = await deepseekForecast5(candidate.symbol, kl.map(k=>({close:Number(k[4])})), pattern);
             if (!ds || ds.confidence < 75) return null;
-
             return { ...candidate, ...ds };
         } catch (e) { return null; }
     }));
-
     results.filter(r => r).forEach(v => accepted.push(v));
     if (accepted.length >= 1) break; 
   }
   return accepted.slice(0, 2);
 }
 
+// --- DB & BOT ---
+if (MONGO_URI) {
+  mongoose.connect(MONGO_URI).then(()=>console.log('[DB] Connected')).catch(e=>console.error('[DB] Error', e));
+}
+const UserSchema = new mongoose.Schema({ tgId: String, isPremium: Boolean, expiresAt: Number });
+const User = mongoose.models.User || mongoose.model('User', UserSchema);
+
+async function activateUser(id) {
+    try { await User.findOneAndUpdate({ tgId: String(id) }, { isPremium: true, expiresAt: Date.now() + 30*24*3600000 }, { upsert: true }); } catch(e){}
+}
+async function checkUser(id) {
+    try { const u = await User.findOne({ tgId: String(id) }); return u && u.isPremium && u.expiresAt > Date.now(); } catch(e){ return false; }
+}
+
+if (TG_BOT_TOKEN) {
+    try {
+        const bot = new Telegraf(TG_BOT_TOKEN);
+        bot.command('start', (ctx) => ctx.reply('Welcome! Use the app.', Markup.inlineKeyboard([Markup.button.webApp('Launch', WEBAPP_URL), Markup.button.callback('Buy PRO', 'buy')])));
+        bot.action('buy', (ctx) => ctx.reply('Price: 1000 RUB. Click Paid.', Markup.inlineKeyboard([Markup.button.callback('I Paid', 'paid')])));
+        bot.action('paid', (ctx) => { activateUser(ctx.from.id); ctx.reply('Activated!'); });
+        bot.launch().catch(()=>{});
+    } catch(e){}
+}
+
+// --- SCANNER JOB ---
 function loadPersistedSignals() {
   try {
     if (!fs.existsSync(DATA_FILE)) return;
     const latest = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     (latest.parsed?.detected || []).forEach(d => {
-        if (d.tag === 'AI' && d.symbol) {
+        if (d.tag === 'AI') {
              const f = latest.parsed?.forecastsBySymbol?.[d.symbol];
              if (f) activeSignals.set(d.symbol, { ...d, ...f, forecastCandles: f.candles });
         }
@@ -251,25 +240,26 @@ async function runScannerJob() {
     const base = all.map(x => ({ symbol: x.symbol, quoteVolume: Number(x.quoteVolume), lastPrice: Number(x.lastPrice), priceChangePercent: Number(x.priceChangePercent) }))
         .filter(x => x.symbol.endsWith('USDT') && isSaneUsdtSymbol(x.symbol) && !isStablecoinLike(x.symbol) && !isLeveraged(x.symbol));
 
-    // Update Signals
     const baseMap = new Map(base.map(b => [b.symbol, b]));
-    const toRemove = [];
-    for (const [sym, sig] of Array.from(activeSignals.entries())) {
-      const tick = baseMap.get(sym);
-      if (!tick) continue;
-      const price = Number(tick.lastPrice);
-      if (sig.status === 'ACTIVE') {
-        if ((sig.direction==='LONG' && price >= sig.target_price) || (sig.direction==='SHORT' && price <= sig.target_price)) {
-            sig.status = 'WON'; sig.removeAt = Date.now()+60000; toRemove.push(sym);
-        } else if ((sig.direction==='LONG' && price <= sig.stop_loss_price) || (sig.direction==='SHORT' && price >= sig.stop_loss_price)) {
-            sig.status = 'LOST'; sig.removeAt = Date.now()+60000; toRemove.push(sym);
-        }
-        sig.price = price;
-      }
-    }
-    toRemove.forEach(s => activeSignals.delete(s));
+    const symbolsToRemove = [];
 
-    // Pick New AI
+    for (const [sym, sig] of Array.from(activeSignals.entries())) {
+        const tick = baseMap.get(sym);
+        if (!tick) continue;
+        const price = Number(tick.lastPrice);
+        
+        let done = false;
+        if (sig.direction === 'LONG') {
+            if (price >= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+60000; done = true; }
+            else if (price <= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+60000; done = true; }
+        } else {
+            if (price <= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+60000; done = true; }
+            else if (price >= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+60000; done = true; }
+        }
+        if (done) symbolsToRemove.push(sym); else sig.price = price;
+    }
+    symbolsToRemove.forEach(sym => activeSignals.delete(sym));
+
     if (activeSignals.size < 5) {
         const aiPool = base.filter(x => x.quoteVolume > MIN_QUOTEVOL_AI);
         const newPicks = await pickAiWithAdaptiveGates(aiPool);
@@ -278,7 +268,6 @@ async function runScannerJob() {
         });
     }
 
-    // Pick FT
     const ftPicks = [];
     const ftCandidates = base.filter(x => x.quoteVolume >= MIN_QUOTEVOL_FT && x.lastPrice >= MIN_PRICE_FT && !activeSignals.has(x.symbol))
         .sort((a,b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent)).slice(0, 60);
@@ -294,7 +283,6 @@ async function runScannerJob() {
         }));
     }
 
-    // Save & Broadcast
     const finalDetected = [...Array.from(activeSignals.values())];
     const forecasts = {};
     activeSignals.forEach(s => {
@@ -325,6 +313,11 @@ async function runScannerJob() {
 }
 
 // --- SERVER START ---
+app.get('/api/user/status', async (req, res) => {
+    const id = req.query.tg_id;
+    const hasAccess = await checkUser(id);
+    res.json({ isPremium: hasAccess });
+});
 app.get('/events', (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*' });
   sseClients.add(res);
@@ -347,7 +340,7 @@ app.get('/api/scheduler/latest', (req, res) => {
     if (fs.existsSync(DATA_FILE)) res.json(JSON.parse(fs.readFileSync(DATA_FILE))); else res.json({});
 });
 
-// Front-end serve
+// Serve frontend
 app.use(express.static(path.join(__dirname, '../dist')));
 app.get('*', (req, res) => {
     if (req.path.startsWith('/api') || req.path.startsWith('/events')) return;
