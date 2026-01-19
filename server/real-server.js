@@ -26,7 +26,7 @@ const MIN_QUOTEVOL_FT = 700_000;
 const MIN_QUOTEVOL_AI = 2_500_000;
 const MAX_SPREAD_FT_PCT = 0.50;
 const MAX_SPREAD_AI_PCT = 0.20;
-const DEPTH_BAND_PCT = 0.20;
+const DEPTH_BAND_PCT = 0.20; 
 const MIN_DEPTH_FT_USDT = 10_000;
 const MIN_DEPTH_AI_USDT = 15_000;
 const BACKTEST_KLINES = 40;
@@ -142,7 +142,7 @@ A technical pattern "${patternName || 'High Volatility'}" has been detected.
 
 **TASK:**
 1. Analyze 50 candles (1m).
-2. Determine direction (LONG/SHORT) based on Market Structure (Higher Highs/Lower Lows).
+2. Determine direction (LONG/SHORT) based on Market Structure.
 3. Calculate TARGET PRICE (Nearest support/resistance in 5 mins).
 4. Calculate STOP LOSS.
 
@@ -239,143 +239,13 @@ function loadPersistedSignals() {
   } catch (e) {}
 }
 
-// --- USERS (MongoDB via Mongoose) ---
-const mongoose = require('mongoose');
-
-const MONGO_URI = process.env.MONGO_URI || null;
-if (MONGO_URI) {
-  mongoose.connect(MONGO_URI)
-    .then(() => console.log('[DB] Connected to MongoDB'))
-    .catch((err) => console.warn('[DB] MongoDB connection error', err));
-} else {
-  console.warn('[DB] MONGO_URI not set - users will not persist to MongoDB');
-}
-
-const UserSchema = new mongoose.Schema({ tgId: { type: String, index: true, unique: true }, isPremium: Boolean, expiresAt: Number }, { timestamps: true });
-const User = mongoose.models.User || mongoose.model('User', UserSchema);
-
-async function activateUser(tgId, durationMs = 365 * 24 * 3600 * 1000) {
-  if (!tgId) return null;
-  try {
-    const expire = Date.now() + Number(durationMs);
-    const u = await User.findOneAndUpdate(
-      { tgId: String(tgId) },
-      { tgId: String(tgId), isPremium: true, expiresAt: expire },
-      { upsert: true, new: true }
-    ).exec();
-    return u;
-  } catch (e) { console.warn('[DB] activateUser error', e); return null; }
-}
-
-async function deactivateUser(tgId) {
-  if (!tgId) return null;
-  try {
-    const u = await User.findOneAndUpdate(
-      { tgId: String(tgId) },
-      { isPremium: false, expiresAt: null },
-      { upsert: true, new: true }
-    ).exec();
-    return u;
-  } catch (e) { console.warn('[DB] deactivateUser error', e); return null; }
-}
-
-async function checkUser(tgId) {
-  if (!tgId) return false;
-  try {
-    const u = await User.findOne({ tgId: String(tgId) }).lean().exec();
-    return !!(u && u.isPremium && (!u.expiresAt || Number(u.expiresAt) > Date.now()));
-  } catch (e) { console.warn('[DB] checkUser error', e); return false; }
-}
-
-// --- TELEGRAM BOT (Telegraf) ---
-try {
-  const TG_TOKEN = process.env.TG_BOT_TOKEN;
-  if (TG_TOKEN) {
-    let Telegraf; let Markup;
-    try { ({ Telegraf, Markup } = require('telegraf')); } catch (e) { console.warn('[TG] telegraf not installed'); }
-    if (Telegraf) {
-      const bot = new Telegraf(TG_TOKEN);
-      const WEBAPP_URL = process.env.WEBAPP_URL || 'https://t.me';
-
-      bot.start(async (ctx) => {
-        const uid = ctx.from && ctx.from.id;
-        if (uid) await deactivateUser(uid);
-        try {
-          await ctx.reply('Welcome to Vortex AI! Use the buttons below to open the WebApp or buy PRO.', Markup.inlineKeyboard([
-            Markup.button.webApp('🚀 Launch Vortex AI', WEBAPP_URL),
-            Markup.button.callback('💎 Buy PRO', 'buy')
-          ]));
-        } catch (e) {
-          try { await ctx.reply('Welcome to Vortex AI! Send /buy to purchase PRO.'); } catch(_){}
-        }
-      });
-
-      bot.command('buy', async (ctx) => {
-        try {
-          await ctx.reply('Price: 1000 RUB. You can pay via Crypto or Card. After payment click ✅ I Paid.', Markup.inlineKeyboard([Markup.button.callback('✅ I Paid', 'paid')]));
-        } catch (e) { try { await ctx.reply('Price: 1000 RUB. Send /paid after payment.'); } catch(_){} }
-      });
-
-      bot.action('buy', async (ctx) => { try { await ctx.answerCbQuery(); await ctx.reply('Price: 1000 RUB. Click ✅ I Paid when done.', Markup.inlineKeyboard([Markup.button.callback('✅ I Paid', 'paid')])); } catch(_){} });
-
-      bot.action('paid', async (ctx) => {
-        try {
-          const uid = ctx.from && ctx.from.id;
-          if (uid) {
-            await activateUser(uid, 365*24*3600*1000);
-            await ctx.reply('Thank you! Your account has been activated as Premium for testing purposes.');
-          }
-        } catch (e) { console.warn('[TG] paid handler error', e); }
-      });
-
-      bot.command('activate', async (ctx) => {
-        try {
-          const parts = (ctx.message && ctx.message.text || '').split(/\s+/);
-          if (parts.length < 2) return ctx.reply('Usage: /activate <tg_id>');
-          const id = Number(parts[1]);
-          await activateUser(id, 365*24*3600*1000);
-          return ctx.reply(`Activated ${id}`);
-        } catch (e) { console.warn('[TG] activate command error', e); return; }
-      });
-
-      bot.launch().then(() => console.log('[TG] Bot started')).catch((e) => console.warn('[TG] Bot launch failed', e));
-    }
-  }
-} catch (e) { console.warn('[TG] Bot init error', e); }
-
-// --- API: user status ---
-app.get('/api/user/status', async (req, res) => {
-  try {
-    const id = req.query.tg_id || req.query.id;
-    if (!id) return res.json({ isPremium: false });
-    const ok = await checkUser(id);
-    return res.json({ isPremium: !!ok });
-  } catch (e) { return res.json({ isPremium: false }); }
-});
-
-// --- Reset Premium (for testing) ---
-app.get('/api/user/reset', async (req, res) => {
-  try {
-    const id = req.query.tg_id || req.query.id;
-    if (!id) {
-      return res.json({ ok: false, message: 'missing tg_id' });
-    }
-    await deactivateUser(id);
-    return res.json({ ok: true });
-  } catch (e) {
-    return res.json({ ok: false });
-  }
-});
-
 async function runScannerJob() {
   if (scanInFlight) return;
   scanInFlight = true;
   console.log('\n🔍 Running Elite Scanner Job...');
 
   try {
-    console.log('Fetching tickers...');
     const all = await fetch24hrTickers();
-    console.log('Tickers fetched:', Array.isArray(all) ? all.length : (all === null ? 'null' : typeof all));
     if (!all) throw new Error("MEXC API Fail");
 
     const base = all.map(x => ({ symbol: x.symbol, quoteVolume: Number(x.quoteVolume), lastPrice: Number(x.lastPrice), priceChangePercent: Number(x.priceChangePercent) }))
@@ -476,9 +346,12 @@ app.get('/api/live/stream', (req, res) => {
 app.get('/api/scheduler/latest', (req, res) => {
     if (fs.existsSync(DATA_FILE)) res.json(JSON.parse(fs.readFileSync(DATA_FILE))); else res.json({});
 });
-// Раздача фронтенда
+
+// Front-end serve
 app.use(express.static(path.join(__dirname, '../dist')));
 app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '../dist/index.html'));
+    if (req.path.startsWith('/api') || req.path.startsWith('/events')) return;
+    res.sendFile(path.join(__dirname, '../dist/index.html'));
 });
+
 app.listen(PORT, () => { try { loadPersistedSignals(); } catch(e){} console.log(`🚀 Server on ${PORT}`); runScannerJob(); });
