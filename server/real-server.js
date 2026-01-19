@@ -36,13 +36,14 @@ const WEBAPP_URL = process.env.WEBAPP_URL || 'https://vortex-ai-nffc.onrender.co
 const MONGO_URI = process.env.MONGO_URI || null;
 const MANAGER_USERNAME = 'meanfive1'; 
 const ADMIN_ID = 8270078362;
-const CHANNEL_USERNAME = '@VortexAiOff'; 
+const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME || '@VortexAiOff';
 
 // --- STATE ---
 let scanInFlight = false;
 const activeSignals = new Map();
 const sseClients = new Set();
 const pendingVerifications = new Map();
+const lastDemoteReasonCounts = { lowPriceVol:0, spreadDepth:0, stddev:0, backtestError:0, backtestThreshold:0, directionalFail:0, insufficientKlines:0, sawtooth:0 };
 
 // --- HELPERS ---
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -107,6 +108,7 @@ function calculateRSI(closes, period=14) {
   return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
+// --- PATTERN DETECTION ---
 function detectPattern(klines) {
     if (klines.length < 5) return null;
     const input = {
@@ -161,11 +163,13 @@ JSON OUTPUT FORMAT: { "target_price": number, "stop_loss_price": number, "direct
   } catch (e) { return null; }
 }
 
+// --- ADAPTIVE PICKER ---
 async function pickAiWithAdaptiveGates(aiPool) {
   const adaptiveSteps = [{ gates: { maxSpreadPct: 0.40, minDepth: 10_000, stddevMax: 0.25, backtestMean: 0.35 } }];
   const accepted = [];
   const pool = aiPool.slice().sort((a,b) => b.quoteVolume - a.quoteVolume).slice(0, 10);
   const blacklist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'USDCUSDT', 'FDUSDUSDT'];
+
   for (const step of adaptiveSteps) {
     const candidatesToCheck = [];
     for (const t of pool) {
@@ -190,18 +194,18 @@ async function pickAiWithAdaptiveGates(aiPool) {
   return accepted.slice(0, 2);
 }
 
-// --- DB ---
+// --- DB & USER ---
 if (MONGO_URI) {
   mongoose.connect(MONGO_URI).then(()=>console.log('[DB] Connected')).catch(e=>console.error('[DB] Error', e));
 }
-const UserSchema = new mongoose.Schema({ 
-    tgId: { type: String, unique: true }, 
-    isPremium: Boolean, 
-    expiresAt: Number, 
-    language: { type: String, default: 'en' },
+const UserSchema = new mongoose.Schema({
+    tgId: String,
+    isPremium: Boolean,
+    expiresAt: Number,
     notificationsEnabled: { type: Boolean, default: true },
-    firstName: String, 
-    username: String 
+    firstName: String,
+    username: String,
+    language: { type: String, enum: ['ru','en'], default: 'ru' }
 });
 const User = mongoose.models.User || mongoose.model('User', UserSchema);
 
@@ -214,87 +218,69 @@ async function checkUser(id) {
 
 let notifyProUsers = async (message) => { console.log('[notifyProUsers] noop', message); };
 
-// --- TEXTS (Multi-Language) ---
-const TEXTS = {
-    ru: {
-        welcome: "👋 Добро пожаловать в Vortex AI!\n\nПожалуйста, подпишитесь на наш канал, чтобы продолжить.",
-        sub_check: "🔄 Проверить подписку",
-        sub_error: "❌ Вы не подписаны на канал. Подпишитесь и нажмите кнопку снова.",
-        lang_select: "🌐 Выберите язык / Select Language:",
-        menu: { app: "🚀 Открыть Терминал", premium: "💎 Премиум", market: "📊 Рынок", settings: "⚙️ Настройки", help: "❓ Помощь" },
-        market: "🔄 Сканирую рынок...",
-        premium_status: "✅ Ваш статус: PRO",
-        premium_buy: "💎 **VORTEX PRO**\n\n• AI Снайпер Сигналы\n• Без задержек\n• Полный доступ\n\n**Цена:** 1000 RUB / 1 Месяц",
-        pay_methods: { crypto: "💠 Крипта (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Карта РФ" },
-        disclaimer: "⚠️ **ЮРИДИЧЕСКИЙ ДИСКЛЕЙМЕР**\n\n1. **Риски:** Торговля криптовалютой сопряжена с высоким риском. Вы можете потерять вложения.\n2. **Гарантии:** Сигналы Vortex AI — это прогнозы, а не финансовые советы. Мы не гарантируем прибыль.\n3. **Возврат:** Средства за подписку не возвращаются.\n\nНажимая кнопку оплаты, вы соглашаетесь с этими условиями.",
-        agree_pay: "✅ Согласен, Оплатить",
-        manual_pay: "👨‍💼 **Ручная оплата**\n\n1. Напишите менеджеру: @meanfive1\n2. Отправьте скриншот после перевода.\n3. Нажмите 'Я Оплатил'.",
-        btn_manager: "📩 Написать Менеджеру",
-        btn_paid: "✅ Я Оплатил",
-        btn_back: "🔙 Назад",
-        settings: "🔔 Уведомления о сигналах:",
-        help: "📚 **ПОМОЩЬ**\n\n• **AI Signals:** Снайперские входы от DeepSeek.\n• **FT:** Зоны перекупленности/перепроданности (RSI).\n\nПо всем вопросам: @meanfive1"
-    },
-    en: {
-        welcome: "👋 Welcome to Vortex AI!\n\nPlease subscribe to our channel to continue.",
-        sub_check: "🔄 Check Subscription",
-        sub_error: "❌ You are not subscribed. Please join and try again.",
-        lang_select: "🌐 Select Language:",
-        menu: { app: "🚀 Open Terminal", premium: "💎 Premium", market: "📊 Market", settings: "⚙️ Settings", help: "❓ Help" },
-        market: "🔄 Scanning...",
-        premium_status: "✅ Your Status: PRO",
-        premium_buy: "💎 **VORTEX PRO**\n\n• AI Sniper Signals\n• Zero Latency\n• Full Access\n\n**Price:** $10 / 1 Month",
-        pay_methods: { crypto: "💠 Crypto (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Bank Card" },
-        disclaimer: "⚠️ **LEGAL DISCLAIMER**\n\n1. **Risk:** Crypto trading involves high risk. You may lose your investment.\n2. **No Guarantees:** Vortex AI signals are forecasts, NOT financial advice.\n3. **No Refunds:** All sales are final.\n\nBy clicking pay, you agree to these terms.",
-        agree_pay: "✅ I Agree & Pay",
-        manual_pay: "👨‍💼 **Manual Payment**\n\n1. Contact manager: @meanfive1\n2. Send screenshot after payment.\n3. Click 'I Paid'.",
-        btn_manager: "📩 Contact Manager",
-        btn_paid: "✅ I Paid",
-        btn_back: "🔙 Back",
-        settings: "🔔 Signal Alerts:",
-        help: "📚 **HELP**\n\n• **AI Signals:** Sniper entries by DeepSeek.\n• **FT:** RSI Oversold/Overbought zones.\n\nSupport: @meanfive1"
-    }
-};
-
-// --- TELEGRAM BOT (V5 - FINAL) ---
+// --- TELEGRAM BOT (FULL V5) ---
 if (TG_BOT_TOKEN) {
     try {
         const bot = new Telegraf(TG_BOT_TOKEN);
 
-        // Middleware: Check Subscription & Save User
+        const mainMenu = Markup.keyboard([['🚀 Open App', '💎 Premium'], ['📊 Market', '⚙️ Settings']]).resize();
+
+        // helper: show main menu localized
+        const showMainMenu = async (ctx, lang='ru') => {
+            const html = (lang === 'en') ?
+                `<b>🚀 Open App</b> — Launch the Neural Terminal. Access real-time AI signals and charts.<br/><b>💎 Premium</b> — 1 Month Access, AI Sniper, Zero Latency.<br/><b>⚙️ Settings</b> — AI Alerts (push notifications).` :
+                `<b>🚀 Открыть приложение</b> — Запустить терминал. Доступ к AI сигналам в реальном времени.<br/><b>💎 Премиум</b> — 1 месяц, AI снайпер, минимальная задержка.<br/><b>⚙️ Настройки</b> — Оповещения AI (push).`;
+            try { await ctx.reply(html, { parse_mode: 'HTML', ...mainMenu }); } catch(e){}
+        };
+
+        // middleware: force subscribe to CHANNEL_USERNAME for non-exempt actions
         bot.use(async (ctx, next) => {
-            if (!ctx.from) return next();
-            
-            // 1. Save/Update User
             try {
-                await User.findOneAndUpdate(
-                    { tgId: String(ctx.from.id) },
-                    { firstName: ctx.from.first_name, username: ctx.from.username },
-                    { upsert: true }
-                );
-            } catch(e){}
+                const fromId = ctx.from?.id;
+                const isExempt = (() => {
+                    if (!ctx.updateType) return false;
+                    if (ctx.updateType === 'message' && ctx.message && ctx.message.text === '/start') return true;
+                    if (ctx.updateType === 'callback_query' && ctx.callbackQuery && typeof ctx.callbackQuery.data === 'string') {
+                        const d = ctx.callbackQuery.data;
+                        if (d.startsWith('lang_') || d === 'check_sub' || d === 'agree_payment' || d.startsWith('lang_') ) return true;
+                    }
+                    if (ctx.updateType === 'message' && ctx.message && ctx.message.text && ctx.message.text.startsWith('/menu')) return true;
+                    return false;
+                })();
 
-            // 2. Check Channel Subscription (Skip for start command to allow language selection first)
-            if (ctx.message && ctx.message.text === '/start') return next();
-            if (ctx.callbackQuery) return next(); // Allow callbacks
-
-            try {
-                const member = await ctx.telegram.getChatMember(CHANNEL_USERNAME, ctx.from.id);
-                if (['left', 'kicked'].includes(member.status)) {
-                    // Check DB for language, default EN
-                    const u = await User.findOne({ tgId: String(ctx.from.id) });
-                    const lang = u?.language || 'en';
-                    return ctx.reply(TEXTS[lang].sub_error, Markup.inlineKeyboard([
-                        Markup.button.url('📢 Join Channel', `https://t.me/${CHANNEL_USERNAME.replace('@','')}`),
-                        Markup.button.callback(TEXTS[lang].sub_check, 'check_sub')
-                    ]));
+                if (fromId && !isExempt) {
+                    try {
+                        const member = await bot.telegram.getChatMember(CHANNEL_USERNAME, fromId);
+                        const ok = member && ['creator','administrator','member'].includes(member.status);
+                        if (!ok) {
+                            const text = `<b>Please subscribe to continue / Подпишитесь для продолжения</b>`;
+                            await ctx.reply(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+                                Markup.button.url('➡️ Channel', `https://t.me/${CHANNEL_USERNAME.replace('@','')}`),
+                                Markup.button.callback('🔁 Check Subscription', 'check_sub')
+                            ])});
+                            return; // stop processing
+                        }
+                    } catch (e) {
+                        // if we cannot check, ask to subscribe as fallback
+                        const text = `<b>Please subscribe to continue / Подпишитесь для продолжения</b>`;
+                        try { await ctx.reply(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard([Markup.button.url('➡️ Channel', `https://t.me/${CHANNEL_USERNAME.replace('@','')}`), Markup.button.callback('🔁 Check Subscription', 'check_sub')])}); } catch(_){}
+                        return;
+                    }
                 }
-            } catch (e) { /* admin rights issue or channel invalid */ }
-            
+            } catch (e) { console.warn('subscribe middleware error', e); }
+            // upsert basic profile (name/username)
+            if (ctx.from) {
+                try {
+                    await User.findOneAndUpdate(
+                        { tgId: String(ctx.from.id) },
+                        { firstName: ctx.from.first_name, username: ctx.from.username },
+                        { upsert: true }
+                    );
+                } catch(e){}
+            }
             return next();
         });
 
-        // NOTIFIER
         notifyProUsers = async (message) => {
           try {
             const users = await User.find({ isPremium: true, notificationsEnabled: true }).lean().exec();
@@ -302,126 +288,181 @@ if (TG_BOT_TOKEN) {
           } catch (e) { console.warn('Notify Error:', e); }
         };
 
-        // COMMANDS
         bot.command('start', async (ctx) => {
-            await ctx.reply('🌐 Language / Язык', Markup.inlineKeyboard([
-                Markup.button.callback('🇺🇸 English', 'set_lang_en'),
-                Markup.button.callback('🇷🇺 Русский', 'set_lang_ru')
-            ]));
+            try {
+                const uid = String(ctx.from.id);
+                let u = await User.findOne({ tgId: uid }).exec();
+                if (!u || !u.language) {
+                    // Ask language
+                    await ctx.reply('<b>Choose language / Выберите язык</b>', {
+                        parse_mode: 'HTML',
+                        ...Markup.inlineKeyboard([
+                            Markup.button.callback('🇷🇺 Русский', 'lang_ru'),
+                            Markup.button.callback('🇺🇸 English', 'lang_en')
+                        ])
+                    });
+                    return;
+                }
+                await showMainMenu(ctx, u.language || 'ru');
+            } catch (e) { console.error('start handler error', e); try{ await ctx.reply('Error'); }catch(_){} }
         });
 
-        bot.action(/^set_lang_(.+)$/, async (ctx) => {
-            const lang = ctx.match[1];
-            await User.findOneAndUpdate({ tgId: String(ctx.from.id) }, { language: lang });
-            const T = TEXTS[lang];
-            
-            await ctx.answerCbQuery();
-            await ctx.reply(T.welcome, Markup.keyboard([
-                [T.menu.app, T.menu.premium],
-                [T.menu.market, T.menu.settings],
-                [T.menu.help]
-            ]).resize());
+        bot.action('lang_ru', async (ctx) => {
+            try {
+                const uid = String(ctx.from.id);
+                await User.findOneAndUpdate({ tgId: uid }, { language: 'ru' }, { upsert: true });
+                await ctx.answerCbQuery();
+                await showMainMenu(ctx, 'ru');
+            } catch (e) { console.warn('lang_ru error', e); }
         });
 
-        bot.action('check_sub', (ctx) => ctx.deleteMessage()); // Just refresh
+        bot.action('lang_en', async (ctx) => {
+            try {
+                const uid = String(ctx.from.id);
+                await User.findOneAndUpdate({ tgId: uid }, { language: 'en' }, { upsert: true });
+                await ctx.answerCbQuery();
+                await showMainMenu(ctx, 'en');
+            } catch (e) { console.warn('lang_en error', e); }
+        });
 
-        // HANDLERS (DYNAMIC LANG)
-        const getT = async (ctx) => {
-            const u = await User.findOne({ tgId: String(ctx.from.id) });
-            return TEXTS[u?.language || 'en'];
-        };
-
-        bot.on('text', async (ctx) => {
-            const T = await getT(ctx);
-            const text = ctx.message.text;
-
-            if (text === T.menu.app) {
-                return ctx.reply('Terminal:', Markup.inlineKeyboard([Markup.button.webApp(T.menu.app, WEBAPP_URL)]));
-            }
-            
-            if (text === T.menu.market) {
-                const isPro = await checkUser(ctx.from.id);
-                if (!isPro) return ctx.reply('🔒 Premium Only');
-                const msg = await ctx.reply(T.market);
+        bot.action('check_sub', async (ctx) => {
+            try {
+                const uid = ctx.from?.id;
+                if (!uid) return await ctx.answerCbQuery();
                 try {
-                    const all = await fetch24hrTickers();
-                    const btc = all?.find(x => x.symbol === 'BTCUSDT');
-                    const top = all?.filter(x => x.symbol.endsWith('USDT') && Number(x.quoteVolume) > 5000000).sort((a,b) => Number(b.priceChangePercent) - Number(a.priceChangePercent)).slice(0, 3);
-                    let report = `📉 **MARKET**\nBTC: $${Number(btc.lastPrice).toFixed(0)}\n\n🚀 **TOP:**\n`;
-                    top.forEach(c => report += `• ${c.symbol}: +${Number(c.priceChangePercent).toFixed(1)}%\n`);
-                    ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, report, { parse_mode: 'Markdown' });
-                } catch(e) { ctx.deleteMessage(msg.message_id); }
-                return;
-            }
-
-            if (text === T.menu.settings) {
-                const u = await User.findOne({ tgId: String(ctx.from.id) });
-                if (!u?.isPremium) return ctx.reply('🔒 Premium Only');
-                const s = u.notificationsEnabled ? '✅ ON' : '❌ OFF';
-                ctx.reply(`${T.settings} ${s}`, Markup.inlineKeyboard([Markup.button.callback('Toggle', 'toggle_alerts')]));
-                return;
-            }
-
-            if (text === T.menu.help) {
-                return ctx.reply(T.help, { parse_mode: 'Markdown' });
-            }
-
-            if (text === T.menu.premium) {
-                const u = await checkUser(ctx.from.id);
-                if (u) return ctx.reply(T.premium_status);
-                
-                // Show Disclaimer First
-                await ctx.reply(T.disclaimer, Markup.inlineKeyboard([Markup.button.callback(T.agree_pay, 'show_payment_methods')]));
-                return;
-            }
+                    const member = await bot.telegram.getChatMember(CHANNEL_USERNAME, uid);
+                    const ok = member && ['creator','administrator','member'].includes(member.status);
+                    if (ok) {
+                        const u = await User.findOne({ tgId: String(uid) }).lean().exec();
+                        await ctx.reply('<b>Thanks — you are subscribed.</b>', { parse_mode: 'HTML' });
+                        await showMainMenu(ctx, (u && u.language) ? u.language : 'ru');
+                    } else {
+                        await ctx.reply('<b>Please subscribe to continue / Подпишитесь для продолжения</b>', { parse_mode: 'HTML' });
+                    }
+                } catch (e) { await ctx.reply('<b>Unable to verify subscription. Please try again.</b>', { parse_mode: 'HTML' }); }
+                await ctx.answerCbQuery();
+            } catch(e){}
         });
 
-        // PAYMENT ACTIONS
-        bot.action('show_payment_methods', async (ctx) => {
-            const T = await getT(ctx);
-            await ctx.editMessageText(T.premium_buy, {
-                parse_mode: 'Markdown',
-                ...Markup.inlineKeyboard([
-                    [Markup.button.callback(T.pay_methods.card, 'pay_manager')],
-                    [Markup.button.callback(T.pay_methods.crypto, 'pay_manager')],
-                    [Markup.button.callback(T.pay_methods.stars, 'pay_stars')]
-                ])
-            });
+        bot.command('admin', async (ctx) => {
+            if (ctx.from.id !== ADMIN_ID) return;
+            const count = await User.countDocuments();
+            const pros = await User.countDocuments({ isPremium: true });
+            ctx.reply(`👑 **ADMIN PANEL**\n\n👥 Total Users: ${count}\n💎 PRO Users: ${pros}\n\nCommands:\n/give <id>\n/del <id>`);
         });
 
-        bot.action('pay_manager', async (ctx) => {
-            const T = await getT(ctx);
-            const msg = `https://t.me/${MANAGER_USERNAME}?text=${encodeURIComponent(T.language === 'en' ? 'Hello, I want to buy Premium.' : 'Привет, хочу купить Премиум.')}`;
-            ctx.editMessageText(T.manual_pay, {
-                parse_mode: 'Markdown',
-                ...Markup.inlineKeyboard([
-                    [Markup.button.url(T.btn_manager, msg)],
-                    [Markup.button.callback(T.btn_paid, 'paid_manual')],
-                    [Markup.button.callback(T.btn_back, 'show_payment_methods')]
-                ])
-            });
+        bot.command('give', async (ctx) => {
+            if (ctx.from.id !== ADMIN_ID) return;
+            const id = ctx.message.text.split(' ')[1];
+            if (id) { await activateUser(id); ctx.reply(`✅ Given PRO to ${id}`); }
         });
 
-        bot.action('pay_stars', async (ctx) => {
-            return ctx.replyWithInvoice({
-                chat_id: ctx.from.id, title: 'Vortex PRO', description: '1 Month', payload: 'pro', provider_token: '', currency: 'XTR', prices: [{ label: '1 Month', amount: 500 }]
-            });
+        bot.hears('🚀 Open App', (ctx) => ctx.reply('Launch Terminal:', Markup.inlineKeyboard([Markup.button.webApp('📱 Open Vortex AI', WEBAPP_URL)])));
+
+        bot.hears('📊 Market', async (ctx) => {
+            const isPro = await checkUser(ctx.from.id);
+            if (!isPro) return ctx.reply('🔒 **Premium Feature.**');
+            const msg = await ctx.reply('Scanning...');
+            try {
+                const all = await fetch24hrTickers();
+                const btc = all?.find(x => x.symbol === 'BTCUSDT');
+                const top = all?.filter(x => x.symbol.endsWith('USDT') && Number(x.quoteVolume) > 5000000).sort((a,b) => Number(b.priceChangePercent) - Number(a.priceChangePercent)).slice(0, 3);
+                let text = `📉 **MARKET**\nBTC: $${Number(btc.lastPrice).toFixed(0)} (${Number(btc.priceChangePercent).toFixed(2)}%)\n\n🚀 **Top Movers:**\n`;
+                top.forEach(c => text += `• ${c.symbol.replace('USDT','')}: +${Number(c.priceChangePercent).toFixed(1)}%\n`);
+                ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, text, { parse_mode: 'Markdown' });
+            } catch (e) { ctx.deleteMessage(msg.message_id); }
         });
+
+        bot.hears('⚙️ Settings', async (ctx) => {
+            const u = await User.findOne({ tgId: String(ctx.from.id) });
+            const s = u?.notificationsEnabled ? '✅ ON' : '❌ OFF';
+            if (!u?.isPremium) return ctx.reply('🔒 **Settings** are available for PRO users only.');
+            ctx.reply(`🔔 AI Alerts: ${s}`, Markup.inlineKeyboard([Markup.button.callback('Toggle Alerts', 'toggle_alerts')]));
+        });
+
+        bot.action('toggle_alerts', async (ctx) => {
+            const u = await User.findOne({ tgId: String(ctx.from.id) });
+            if (!u || !u.isPremium) return ctx.answerCbQuery('Only for PRO users');
+            u.notificationsEnabled = !u.notificationsEnabled;
+            await u.save();
+            ctx.editMessageText(`🔔 AI Alerts: ${u.notificationsEnabled ? '✅ ON' : '❌ OFF'}`, Markup.inlineKeyboard([Markup.button.callback('Toggle', 'toggle_alerts')]));
+        });
+
+        bot.hears('💎 Premium', async (ctx) => {
+            try {
+                const urec = await User.findOne({ tgId: String(ctx.from.id) }).lean().exec();
+                const lang = (urec && urec.language) ? urec.language : 'ru';
+                const isPro = await checkUser(ctx.from.id);
+                if (isPro) return ctx.reply('<b>✅ You are PRO.</b>', { parse_mode: 'HTML' });
+
+                const disclaimerRU = `<b>Юридический отказ от ответственности</b>\nЯ не несу ответственности за финансовые потери. Торговля криптовалютой рискована. Вы соглашаетесь, что используете сигналы на свой страх и риск.`;
+                const disclaimerEN = `<b>Legal Disclaimer</b>\nI am not responsible for financial losses. Trading cryptocurrencies involves risk. You agree to use signals at your own risk.`;
+                const longDisclaimer = (lang === 'en') ? disclaimerEN : disclaimerRU;
+
+                await ctx.reply(longDisclaimer, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('✅ I Agree & Continue', 'agree_payment')]]) });
+            } catch (e) { console.warn('premium error', e); }
+        });
+
+        bot.action('agree_payment', async (ctx) => {
+            try {
+                const uid = String(ctx.from.id);
+                const u = await User.findOne({ tgId: uid }).lean().exec();
+                const lang = (u && u.language) ? u.language : 'ru';
+                const managerText = encodeURIComponent(lang === 'en' ? 'Hello, I want to buy Premium.' : 'Привет, хочу купить Премиум.');
+                const managerLink = `https://t.me/${MANAGER_USERNAME}?text=${managerText}`;
+
+                const payHtml = (lang === 'en') ?
+                    `<b>VORTEX PRO</b>\n1 Month Access — AI Sniper — Zero Latency. Choose payment:` :
+                    `<b>VORTEX PRO</b>\n1 месяц — AI снайпер — Минимальная задержка. Выберите способ оплаты:`;
+
+                await ctx.editMessageText(payHtml, { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+                    [Markup.button.url(lang === 'en' ? 'Contact Manager' : '📩 Написать Менеджеру', managerLink)],
+                    [Markup.button.callback(lang === 'en' ? '✅ I Paid' : '✅ Я Оплатил', 'paid_manual')],
+                    [Markup.button.callback(lang === 'en' ? 'Back' : '🔙 Назад', 'back_premium')]
+                ])});
+                await ctx.answerCbQuery();
+            } catch (e) { console.warn('agree_payment error', e); }
+        });
+
+        // 2. MANAGER PAYMENT (FIXED)
+        bot.action('pay_manager', (ctx) => {
+            const userId = ctx.from.id;
+            const messageText = encodeURIComponent("Привет.\n\nНужны реквизиты для оплаты переводом на карту.");
+            const managerLink = `https://t.me/${MANAGER_USERNAME}?text=${messageText}`;
+
+            ctx.editMessageText(
+                `💳 **Способ оплаты: Перевод на карту** 🇷🇺\n` +
+                `💰 **К оплате:** 1000 RUB\n` +
+                `🆔 **Ваш ID:** \`${userId}\`\n\n` +
+                `👋 Напиши менеджеру по кнопке ниже, он выдаст реквизиты.\n\n` +
+                `⚡️ **ПОСЛЕ ПЕРЕВОДА** — возвращайся сюда и жми кнопку **"✅ Я Оплатил"**. Затем отправляй скриншот.\n\n` +
+                `_Доступ выдаётся в течение 5 минут._`,
+                {
+                    parse_mode: 'Markdown',
+                    ...Markup.inlineKeyboard([
+                        [Markup.button.url('📩 Написать Менеджеру', managerLink)],
+                        [Markup.button.callback('✅ Я Оплатил', 'paid_manual')],
+                        [Markup.button.callback('🔙 Назад', 'back_premium')]
+                    ])
+                }
+            );
+        });
+
+        bot.action('back_premium', (ctx) => ctx.deleteMessage());
 
         bot.action('paid_manual', async (ctx) => {
             await ctx.answerCbQuery();
-            await ctx.reply('📸 Screenshot please / Скриншот пожалуйста');
+            await ctx.reply('📸 **Пожалуйста, отправьте скриншот оплаты сюда.**');
             pendingVerifications.set(ctx.from.id, true);
         });
 
-        // ADMIN APPROVAL
         bot.on('photo', async (ctx) => {
             if (pendingVerifications.get(ctx.from.id)) {
                 pendingVerifications.delete(ctx.from.id);
                 const photoId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-                await ctx.reply('⏳ Wait for admin...');
+                await ctx.reply('⏳ **Проверка...** Админ проверит платеж.');
                 await bot.telegram.sendPhoto(ADMIN_ID, photoId, {
-                    caption: `💰 Payment: ${ctx.from.first_name} (ID: ${ctx.from.id})`,
+                    caption: `💰 **Payment**\nUser: ${ctx.from.first_name} (ID: ${ctx.from.id})\n@${ctx.from.username}`,
                     ...Markup.inlineKeyboard([Markup.button.callback('✅ Approve', `approve_${ctx.from.id}`), Markup.button.callback('❌ Reject', `reject_${ctx.from.id}`)])
                 });
             }
@@ -430,21 +471,24 @@ if (TG_BOT_TOKEN) {
         bot.action(/^approve_(\d+)$/, async (ctx) => {
             const userId = ctx.match[1];
             await activateUser(userId);
-            await bot.telegram.sendMessage(userId, '🎉 Premium Activated!');
-            ctx.editMessageCaption(ctx.callbackQuery.message.caption + '\n\n✅ APPROVED');
+            await bot.telegram.sendMessage(userId, '🎉 **Оплата принята!** PRO доступ активирован.\nПерезапустите приложение.');
+            ctx.editMessageCaption(ctx.callbackQuery.message.caption + '\n\n✅ ОДОБРЕНО');
         });
 
-        bot.action('toggle_alerts', async (ctx) => {
-            const u = await User.findOne({ tgId: String(ctx.from.id) });
-            u.notificationsEnabled = !u.notificationsEnabled;
-            await u.save();
-            ctx.reply('Updated.');
+        bot.action(/^reject_(\d+)$/, async (ctx) => {
+            const userId = ctx.match[1];
+            await bot.telegram.sendMessage(userId, '❌ **Оплата отклонена.** Свяжитесь с поддержкой.');
+            ctx.editMessageCaption(ctx.callbackQuery.message.caption + '\n\n❌ ОТКЛОНЕНО');
         });
+
+        bot.action('pay_stars', (ctx) => ctx.replyWithInvoice({ chat_id: ctx.from.id, title: 'PRO', description: '1 Month', payload: 'pro', provider_token: '', currency: 'XTR', prices: [{ label: '1 Month', amount: 500 }] }));
+        bot.on('pre_checkout_query', (ctx) => ctx.answerPreCheckoutQuery(true));
+        bot.on('successful_payment', async (ctx) => { await activateUser(ctx.from.id); ctx.reply('🎉 Paid!'); });
 
         bot.launch().then(() => console.log('🤖 Bot Started'));
+        
         process.once('SIGINT', () => bot.stop('SIGINT'));
         process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
     } catch(e) { console.error('Bot Error:', e); }
 }
 
