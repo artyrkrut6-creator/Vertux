@@ -1,10 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Maximize2, Minimize2, ExternalLink, ChevronLeft, LayoutPanelLeft, ArrowLeft, Activity } from 'lucide-react';
+import { Maximize2, Minimize2, ExternalLink, ChevronLeft, LayoutPanelLeft, ChevronUp, ChevronDown, Activity, X } from 'lucide-react';
 import Sidebar from './Sidebar';
 import ChartContainer from './ChartContainer';
 import ChartBottomPanel from './ChartBottomPanel';
-// SmartSearchButton removed for mobile-first build
+import SmartSearchButton from './SmartSearchButton';
 import useScannerStore, { DetectedCoin } from '../store/scannerStore';
 
 const EASE = [0.4, 0, 0.2, 1];
@@ -14,7 +14,7 @@ const Layout: React.FC = () => {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [viewState, setViewState] = useState<'LIST' | 'CHART'>('LIST');
-  const [showPanel, setShowPanel] = useState(true);
+  const [panelState, setPanelState] = useState<'NORMAL' | 'FULL' | 'HIDDEN'>('NORMAL');
 
   const coins = useScannerStore((s) => s.coins || []);
   const addDetectedCoin = useScannerStore((s) => s.addDetectedCoin);
@@ -111,10 +111,7 @@ const Layout: React.FC = () => {
     return () => { alive = false; try { es?.close(); } catch (_) {} };
   }, [addDetectedCoin, setNextScanAt]);
 
-  const handleSelect = (s: string) => {
-    setSelected(s);
-    if (isMobile) setViewState('CHART');
-  };
+  const handleSelect = (s: string) => { setSelected(s); if (isMobile) setViewState('CHART'); };
 
   const tradeLink = `https://www.mexc.com/exchange/${(selected || 'BTCUSDT').replace('USDT', '_USDT')}`;
   const currentCoin = coins.find(c => String(c.symbol).toUpperCase() === String(selected || '').toUpperCase());
@@ -140,21 +137,29 @@ const Layout: React.FC = () => {
                 <motion.div key="chart" initial={{ x: 300, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: -300, opacity: 0 }} transition={{ duration: 0.28 }} className="absolute inset-0 z-50 bg-transparent flex flex-col">
                   <div className="h-12 flex items-center px-3 bg-black/60 border-b border-white/5">
                      <button onClick={() => setViewState('LIST')} className="p-2 rounded-md bg-white/5 mr-3">
-                        <ArrowLeft />
-                     </button>
-                     <button onClick={() => setShowPanel(s => !s)} className={`p-2 rounded-md bg-white/5 mr-3 ${showPanel ? 'shadow-[0_0_12px_rgba(124,58,237,0.25)]' : ''}`} aria-pressed={showPanel}>
-                        <Activity />
+                        <ChevronLeft />
                      </button>
                      <div className="font-bold">{selected || 'BTCUSDT'}</div>
                   </div>
-                  <div className="flex-1 relative">
+                  <div className={`flex ${panelState === 'FULL' ? 'h-0 overflow-hidden' : 'flex-[1.5] min-h-0'}`}>
                     <ChartContainer symbol={selected ?? 'BTCUSDT'} />
                   </div>
                   <AnimatePresence>
-                    {showPanel && (
-                      <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.22 }} className="z-40">
-                        <div className="bg-black/20 border-t border-white/5">
-                          <div className="p-2">
+                    {panelState !== 'HIDDEN' && (
+                      <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: panelState === 'FULL' ? '100%' : '40vh', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.22 }} className={`${panelState === 'FULL' ? 'flex-1' : 'flex-1 min-h-0'} z-40` }>
+                        <div className="w-full h-full flex flex-col bg-black/20 border-t border-white/5">
+                          <div className="flex items-center justify-between px-4 py-1 border-b border-white/5 bg-black/20 text-xs">
+                            <span className="text-gray-500 font-bold uppercase tracking-wider">Analysis & Depth</span>
+                            <div className="flex gap-1">
+                              <button onClick={() => setPanelState(panelState === 'NORMAL' ? 'FULL' : 'NORMAL')} className="p-1 hover:text-white text-gray-400">
+                                {panelState === 'NORMAL' ? <ChevronUp size={16}/> : <ChevronDown size={16}/>}
+                              </button>
+                              <button onClick={() => setPanelState('HIDDEN')} className="p-1 hover:text-red-400 text-gray-400">
+                                <X size={16}/>
+                              </button>
+                            </div>
+                          </div>
+                          <div className="flex-1 p-2 overflow-auto custom-scrollbar">
                             <ChartBottomPanel coin={currentCoin} />
                           </div>
                         </div>
@@ -190,15 +195,26 @@ const Layout: React.FC = () => {
                  </a>
               </div>
 
-              <div className="flex-1 min-h-0 w-full relative z-10">
-                <ChartContainer symbol={selected ?? 'BTCUSDT'} />
+              <div className={`w-full relative z-10 transition-all duration-300 ${panelState === 'FULL' ? 'h-0 overflow-hidden' : panelState === 'NORMAL' ? 'flex-[1.5] min-h-0' : 'flex-1'}`}>
+                 <ChartContainer symbol={selected ?? 'BTCUSDT'} />
               </div>
 
               <AnimatePresence>
-                {showPanel && (
-                  <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.22 }} className="flex-shrink-0 w-full z-20">
-                     <div className="bg-black/20 border-t border-white/5 backdrop-blur-md">
-                        <div className="p-2">
+                {panelState !== 'HIDDEN' && (
+                  <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: panelState === 'FULL' ? '100%' : '40vh', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.22 }} className={`${panelState === 'FULL' ? 'flex-1' : 'flex-1 min-h-0'} w-full z-20` }>
+                     <div className="w-full h-full flex flex-col bg-black/20 border-t border-white/5">
+                        <div className="flex items-center justify-between px-4 py-1 border-b border-white/5 bg-black/20 text-xs">
+                          <span className="text-gray-500 font-bold uppercase tracking-wider">Analysis & Depth</span>
+                          <div className="flex gap-1">
+                            <button onClick={() => setPanelState(panelState === 'NORMAL' ? 'FULL' : 'NORMAL')} className="p-1 hover:text-white text-gray-400">
+                              {panelState === 'NORMAL' ? <ChevronUp size={16}/> : <ChevronDown size={16}/>}
+                            </button>
+                            <button onClick={() => setPanelState('HIDDEN')} className="p-1 hover:text-red-400 text-gray-400">
+                              <X size={16}/>
+                            </button>
+                          </div>
+                        </div>
+                        <div className="flex-1 p-2 overflow-auto custom-scrollbar">
                           <ChartBottomPanel coin={currentCoin} />
                         </div>
                      </div>
