@@ -65,6 +65,7 @@ const Layout: React.FC = () => {
       if (!Array.isArray(list)) return;
       for (const item of list) {
         if (!item?.symbol || !item?.tag) continue;
+        const changeRaw = item.change24hPct ?? item.priceChangePercent;
         const coin: DetectedCoin = {
           symbol: String(item.symbol).toUpperCase(),
           tag: item.tag === 'AI' ? 'AI' : 'FT',
@@ -154,7 +155,7 @@ const Layout: React.FC = () => {
                     <ChartContainer symbol={selected ?? 'BTCUSDT'} />
                   </div>
 
-                  {/* Mobile Bottom Panel (Fixed Height) */}
+                  {/* Mobile Bottom Panel */}
                   <div className="h-[35%] shrink-0 border-t border-white/10 bg-black/20 overflow-y-auto">
                      <div className="p-2">
                         <ChartBottomPanel coin={currentCoin} />
@@ -239,7 +240,7 @@ const Layout: React.FC = () => {
                   </motion.div>
                 )}
               </AnimatePresence>
-            </motion.div>
+            </motion.main>
           </>
         )}
       </div>
