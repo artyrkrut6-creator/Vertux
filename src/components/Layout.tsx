@@ -1,0 +1,190 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Maximize2, Minimize2, ExternalLink, ChevronLeft, LayoutPanelLeft } from 'lucide-react';
+import Sidebar from './Sidebar';
+import ChartContainer from './ChartContainer';
+import ChartBottomPanel from './ChartBottomPanel';
+import useScannerStore, { DetectedCoin } from '../store/scannerStore';
+
+const EASE = [0.4, 0, 0.2, 1];
+
+const Layout: React.FC = () => {
+  const [selected, setSelected] = useState<string | undefined>('BTCUSDT');
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
+
+  const coins = useScannerStore((s) => s.coins || []);
+  const addDetectedCoin = useScannerStore((s) => s.addDetectedCoin);
+  const removeCoin = useScannerStore((s) => s.removeCoin);
+  const setNextScanAt = useScannerStore((s) => s.setNextScanAt);
+  const setPremium = useScannerStore((s) => s.setPremium);
+
+  const preferred = useMemo(() => {
+    const ai = coins.find((c) => c.tag === 'AI');
+    return ai?.symbol || coins[0]?.symbol;
+  }, [coins]);
+
+  useEffect(() => {
+    try {
+      const tg = (window as any).Telegram?.WebApp;
+      if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) {
+        const id = tg.initDataUnsafe.user.id;
+        fetch(`/api/user/status?tg_id=${id}`).then(r => r.json()).then(j => {
+          setPremium(!!(j && j.isPremium));
+        }).catch(() => setPremium(false));
+      } else {
+        setPremium(false);
+      }
+    } catch (e) { setPremium(false); }
+  }, [setPremium]);
+    if (preferred && !selected) setSelected(preferred);
+  }, [preferred, selected]);
+
+  useEffect(() => {
+    const checkMobile = () => setIsMobile(window.innerWidth < 768);
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
+
+  useEffect(() => {
+    let es: EventSource | null = null;
+    let alive = true;
+    const ingest = (payload: any) => {
+      try { if (payload && payload.nextScanAt) setNextScanAt(Number(payload.nextScanAt)); } catch (_) {}
+      const parsed = payload?.parsed || payload;
+      const list = parsed?.detected;
+      if (!Array.isArray(list)) return;
+      for (const item of list) {
+        if (!item?.symbol || !item?.tag) continue;
+        const changeRaw = item.change24hPct ?? item.priceChangePercent;
+        const coin: DetectedCoin = {
+          symbol: String(item.symbol).toUpperCase(),
+          tag: item.tag === 'AI' ? 'AI' : 'FT',
+          detectedAt: Number(item.detectedAt) || Date.now(),
+          expiresAt: Number(item.expiresAt) || (Date.now() + 5 * 60_000),
+          stdDev: Number(item.stdDev ?? item.score ?? 0) || 0,
+          price: Number(item.price ?? 0) || 0,
+          quoteVolume: item.quoteVolume !== undefined ? Number(item.quoteVolume) : undefined,
+          change24hPct: changeRaw !== undefined ? Number(changeRaw) : undefined,
+          rsi: item.rsi !== undefined ? Number(item.rsi) : undefined,
+          signal: item.signal !== undefined ? item.signal : undefined,
+          spreadPct: item.spreadPct,
+          depthUSDT: item.depthUSDT
+        };
+        addDetectedCoin(coin);
+      }
+    };
+    (async () => {
+      try {
+        const r = await fetch('/api/scheduler/latest');
+        if (r.ok) { const j = await r.json(); if (alive) ingest(j); }
+      } catch (_) {}
+      try {
+        es = new EventSource('/events');
+        es.addEventListener('open', () => console.log('[Layout] SSE open'));
+        es.addEventListener('scheduled_update', (ev: MessageEvent) => {
+          try { const j = JSON.parse(ev.data); ingest(j); } catch (_) {}
+        });
+      } catch (_) {}
+    })();
+    return () => { alive = false; try { es?.close(); } catch (_) {} };
+  }, [addDetectedCoin, setNextScanAt]);
+
+  const handleSelect = (s: string) => {
+    setSelected(s);
+    if (isMobile) setIsFullscreen(true);
+  };
+
+  const handleSignalResolved = (sym: string) => {
+    try {
+      removeCoin(sym);
+      // pick next available coin
+      const next = coins.find(c => String(c.symbol).toUpperCase() !== String(sym).toUpperCase());
+      if (next) setSelected(next.symbol);
+      else setSelected(undefined);
+
+      // fire-and-forget notify (optional)
+      try { fetch(`/api/signal/resolved?symbol=${encodeURIComponent(sym)}`, { method: 'POST' }); } catch (_) {}
+    } catch (_) {}
+  };
+
+  const tradeLink = `https://www.mexc.com/exchange/${(selected || 'BTCUSDT').replace('USDT', '_USDT')}`;
+  const currentCoin = coins.find(c => String(c.symbol).toUpperCase() === String(selected || '').toUpperCase());
+
+  return (
+    <div className="h-screen bg-[#050505] text-white overflow-hidden flex flex-col font-sans selection:bg-violet-500/30">
+      <div className="fixed inset-0 pointer-events-none z-0">
+         <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-violet-900/10 blur-[120px] rounded-full" />
+         <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-blue-900/10 blur-[120px] rounded-full" />
+      </div>
+
+      <div className="flex-1 flex w-full h-full relative z-10 p-2 gap-2 overflow-hidden">
+        <AnimatePresence mode="popLayout">
+          {(!isFullscreen || !isMobile) && !isFullscreen && (
+            <motion.aside
+              initial={{ width: 0, opacity: 0, x: -20 }}
+              animate={{ width: isMobile ? '100%' : 360, opacity: 1, x: 0 }}
+              exit={{ width: 0, opacity: 0, x: -20 }}
+              transition={{ duration: 0.42, ease: EASE }}
+              className={`h-full flex flex-col ${isMobile ? 'w-full absolute inset-0 z-50 bg-[#050505]' : 'relative'}`}
+            >
+               <Sidebar onSelect={handleSelect} selected={selected} />
+            </motion.aside>
+          )}
+        </AnimatePresence>
+
+        <motion.main 
+          layout
+          className="flex-1 flex flex-col h-full min-w-0 bg-white/5 border border-white/10 rounded-2xl backdrop-blur-xl shadow-2xl relative overflow-hidden"
+        >
+          <div className="h-14 flex-shrink-0 border-b border-white/5 flex items-center justify-between px-4 bg-black/20 z-30 relative">
+             <div className="flex items-center gap-2">
+                {isMobile && (
+                  <button onClick={() => setIsFullscreen(false)} className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-gray-400">
+                    <ChevronLeft size={20} />
+                  </button>
+                )}
+                {!isMobile && (
+                  <button onClick={() => setIsFullscreen(!isFullscreen)} className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/5 transition-all group">
+                    {isFullscreen ? <LayoutPanelLeft size={16} className="text-violet-400 group-hover:scale-110 transition-transform"/> : <Maximize2 size={16} className="text-gray-400"/>}
+                    <span className="text-xs font-bold text-gray-300">{isFullscreen ? 'SHOW LIST' : 'EXPAND'}</span>
+                  </button>
+                )}
+                <div className="h-6 w-[1px] bg-white/10 mx-2" />
+                <span className="font-bold text-lg tracking-tight text-white/90">{selected || 'BTCUSDT'}</span>
+             </div>
+             <a href={tradeLink} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 px-4 py-1.5 bg-gradient-to-r from-violet-600 to-indigo-600 rounded-lg shadow-lg shadow-violet-500/20 hover:shadow-violet-500/40 hover:scale-105 active:scale-95 transition-all group">
+               <span className="text-xs font-bold tracking-wide">TRADE</span>
+               <ExternalLink size={14} className="group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
+             </a>
+          </div>
+
+          <div className="flex-1 min-h-0 w-full relative z-10 overflow-hidden">
+             {/* Animation Wrapper HERE */}
+             <AnimatePresence mode="wait">
+               <motion.div
+                 key={selected}
+                 initial={{ opacity: 0, scale: 0.98, filter: "blur(4px)" }}
+                 animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
+                 exit={{ opacity: 0, scale: 0.98, filter: "blur(4px)" }}
+                 transition={{ duration: 0.25 }}
+                 className="w-full h-full"
+               >
+                 <ChartContainer symbol={selected ?? 'BTCUSDT'} onSignalResolved={handleSignalResolved} />
+               </motion.div>
+             </AnimatePresence>
+          </div>
+
+          <div className="flex-shrink-0 w-full z-20 bg-black/20 border-t border-white/5 backdrop-blur-md">
+             <div className="p-2">
+               <ChartBottomPanel coin={currentCoin} />
+             </div>
+          </div>
+        </motion.main>
+      </div>
+    </div>
+  );
+};
+
+export default Layout;

@@ -1,0 +1,44 @@
+{
+  "name": "vortex-ai-webapp",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "api": "node server/real-server.js",
+    "dev:all": "concurrently \"npm run api\" \"npm run dev\"",
+    "start": "node server/real-server.js",
+    "render-build": "npm install && npm run build"
+  },
+  "dependencies": {
+    "@types/canvas-confetti": "^1.9.0",
+    "axios": "^1.5.0",
+    "canvas-confetti": "^1.9.4",
+    "clsx": "^2.1.1",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^4.22.1",
+    "framer-motion": "^10.12.16",
+    "groq-sdk": "^0.37.0",
+    "https-proxy-agent": "^7.0.6",
+    "lightweight-charts": "^3.7.0",
+    "lucide-react": "^0.268.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-ts-tradingview-widgets": "^1.2.8",
+    "socks-proxy-agent": "^8.0.5",
+    "tailwind-merge": "^3.4.0",
+    "technicalindicators": "^3.1.0",
+    "telegraf": "^4.16.3",
+    "zustand": "^4.5.7"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.0.0",
+    "autoprefixer": "^10.4.14",
+    "concurrently": "^8.0.0",
+    "postcss": "^8.4.21",
+    "tailwindcss": "^3.4.7",
+    "vite": "^5.0.0"
+  }
+}

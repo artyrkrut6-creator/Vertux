@@ -1,0 +1,21 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root{
+  --bg: #050505;
+  --primary: #9D00FF;
+}
+
+html,body,#root{height:100%}
+body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,'Helvetica Neue',Arial}
+.glow-primary{box-shadow:0 0 12px rgba(157,0,255,0.8)}
+
+/* small utility for dashed forecast */
+.forecast-line{stroke-dasharray:4 6; stroke:var(--primary)}
+
+@layer utilities{
+  .text-glow{ text-shadow: 0 0 8px rgba(157,0,255,0.6) }
+}

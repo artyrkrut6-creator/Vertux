@@ -1,0 +1,6 @@
+{
+  "use_local_baseline": true,
+  "delete_old_prompts": false,
+  "prompt_path": "./external_inputs/prompt_to_model.json",
+  "incoming_forecast_path": "./external_inputs/incoming_forecast.json"
+}
