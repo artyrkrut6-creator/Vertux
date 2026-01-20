@@ -25,11 +25,12 @@ if (PROXY_URL) {
 const MIN_PRICE_FT = 0.02;
 const MIN_PRICE_AI = 0.10;
 const MIN_QUOTEVOL_FT = 700_000;
-const MIN_QUOTEVOL_AI = 2_500_000;
+const MIN_QUOTEVOL_AI = 1_500_000;
 const MAX_SPREAD_FT_PCT = 0.50;
-const MAX_SPREAD_AI_PCT = 0.40;
+const MAX_SPREAD_AI_PCT = 0.60;
 const MIN_DEPTH_FT_USDT = 10_000;
-const MIN_DEPTH_AI_USDT = 10_000;
+const MIN_DEPTH_AI_USDT = 5_000;
+const BACKTEST_MEAN_PCT = 0.60;
 const BACKTEST_KLINES = 40;
 const CHUNK_SIZE = 20; 
 const UI_INTERVAL = 300_000; 
@@ -168,7 +169,10 @@ JSON OUTPUT FORMAT: { "target_price": number, "stop_loss_price": number, "direct
 
 // --- ADAPTIVE PICKER ---
 async function pickAiWithAdaptiveGates(aiPool) {
-  const adaptiveSteps = [{ gates: { maxSpreadPct: 0.40, minDepth: 10_000, stddevMax: 0.25, backtestMean: 0.35 } }];
+    const adaptiveSteps = [
+        { gates: { maxSpreadPct: MAX_SPREAD_AI_PCT, minDepth: MIN_DEPTH_AI_USDT, stddevMax: 0.35, backtestMean: BACKTEST_MEAN_PCT } },
+        { gates: { maxSpreadPct: MAX_SPREAD_AI_PCT, minDepth: MIN_DEPTH_AI_USDT, stddevMax: 0.50, backtestMean: BACKTEST_MEAN_PCT } }
+    ];
   const accepted = [];
   const pool = aiPool.slice().sort((a,b) => b.quoteVolume - a.quoteVolume).slice(0, 10);
   const blacklist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'USDCUSDT', 'FDUSDUSDT'];
@@ -186,7 +190,7 @@ async function pickAiWithAdaptiveGates(aiPool) {
             const pattern = detectPattern(kl);
             if (!pattern) return null;
             const ds = await deepseekForecast5(candidate.symbol, kl.map(k=>({close:Number(k[4])})), pattern);
-            if (!ds || ds.confidence < 75) return null;
+            if (!ds || ds.confidence < 60) return null;
             return { ...candidate, ...ds };
         } catch (e) { return null; }
     }));
