@@ -53,7 +53,7 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function mexcFetchJSON(url) {
   const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), 15000); // 15s Hard Timeout
+  const id = setTimeout(() => controller.abort(), 10000);
   try {
     const res = agent ? await fetch(url, { agent, signal: controller.signal }) : await fetch(url, { signal: controller.signal });
     clearTimeout(id);
@@ -111,53 +111,72 @@ function calculateRSI(closes, period=14) {
   return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
-function detectPattern(klines) {
-    if (klines.length < 5) return null;
-    const input = {
-        open: klines.map(k=>Number(k[1])),
-        high: klines.map(k=>Number(k[2])),
-        low: klines.map(k=>Number(k[3])),
-        close: klines.map(k=>Number(k[4])),
-    };
-    if (BullishEngulfing.hasPattern(input)) return "Bullish Engulfing";
-    if (BearishEngulfing.hasPattern(input)) return "Bearish Engulfing";
-    if (Hammer.hasPattern(input)) return "Hammer";
-    if (ShootingStar.hasPattern(input)) return "Shooting Star";
-    const bb = BollingerBands.calculate({period: 20, stdDev: 2, values: input.close});
-    if (bb.length > 0) {
-        const last = bb[bb.length-1];
-        if ((last.upper - last.lower) / (last.middle || 1) < 0.015) return "Bollinger Squeeze";
-    }
-    return null;
+// --- STAGE 1: SELECTION ---
+async function deepseekSelectWinner(candidates) {
+  if (!SILICON_KEY) return null;
+  
+  const system = `You are a Senior Quant Trader.
+Analyze 10 assets. Pick the SINGLE BEST opportunity for a 5-20 min scalp.
+Criteria: Market Structure, Volume Anomalies, RSI Divergence.
+OUTPUT: Just the Ticker Symbol of the winner (e.g. "BTCUSDT").`;
+
+  let userMsg = "Analyze these assets:\n";
+  candidates.forEach((c, i) => {
+      const candlesStr = c.klines.slice(-10).map(k => `[O:${k[1]} H:${k[2]} L:${k[3]} C:${k[4]} V:${k[5]}]`).join(' ');
+      userMsg += `Asset ${i+1}: ${c.symbol}. RSI: ${c.rsi.toFixed(1)}. Candles: ${candlesStr}\n\n`;
+  });
+  userMsg += "Which one is the winner? Return ONLY the symbol.";
+
+  try {
+    const r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
+        method: 'POST', headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-ai/DeepSeek-V3', messages: [{ role: 'system', content: system }, { role: 'user', content: userMsg }], temperature: 0.1 }),
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const content = j?.choices?.[0]?.message?.content || '';
+    const winner = candidates.find(c => content.includes(c.symbol));
+    return winner || null;
+  } catch (e) { return null; }
 }
 
-// --- DEEPSEEK ---
-async function deepseekForecast5(symbol, contextCandles) {
+// --- STAGE 2: EXECUTION ---
+async function deepseekExecution(winner) {
   if (!SILICON_KEY) return null;
-  const system = `You are Vortex AI. Output JSON: { "target_price": number, "stop_loss_price": number, "direction": "LONG"|"SHORT", "confidence": 0-100, "forecast_1m": [ ...5 candles... ] }`;
-  const user = `Symbol: ${symbol}. Last close: ${contextCandles[contextCandles.length-1].close}. Predict now.`;
+
+  const klines = await fetchMexcKlines(winner.symbol, '1m', 50);
+  const depth = await fetchMexcDepth(winner.symbol, 20);
   
+  const candlesStr = klines.slice(-50).map(k => `[T:${new Date(k[0]).toTimeString().slice(0,5)} O:${k[1]} H:${k[2]} L:${k[3]} C:${k[4]} V:${k[5]}]`).join('\n');
+
+  const system = `You are Vortex AI. Output JSON: { "target_price": number, "stop_loss_price": number, "direction": "LONG"|"SHORT", "confidence": 0-100, "forecast_1m": [ ...5 candles... ] }`;
+  const user = `Final Analysis for ${winner.symbol}. Price: ${winner.price}. RSI: ${winner.rsi.toFixed(1)}.
+OrderBook Bids: ${depth?.bids?.[0]?.[0]}. Asks: ${depth?.asks?.[0]?.[0]}.
+Last 50 Candles:
+${candlesStr}
+Predict NOW.`;
+
   const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), 20000); 
+  const id = setTimeout(() => controller.abort(), 25000); 
+
   try {
-    console.log(`🤖 AI Request: ${symbol}`);
+    console.log(`🤖 AI Executing: ${winner.symbol}`);
     const r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
-      method: 'POST', headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'deepseek-ai/DeepSeek-V3', messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0.1, response_format: { type: 'json_object' } }),
-      signal: controller.signal
+        method: 'POST', headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-ai/DeepSeek-V3', messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0.1, response_format: { type: 'json_object' } }),
+        signal: controller.signal
     });
     clearTimeout(id);
-    if (!r.ok) { console.log(`❌ AI Error ${r.status}`); return null; }
-
+    if (!r.ok) return null;
     const j = await r.json();
     let content = j?.choices?.[0]?.message?.content || '{}';
     if (content.includes('```json')) content = content.split('```json')[1].split('```')[0].trim();
     const parsed = JSON.parse(content);
     if (!parsed.target_price) return null;
-    
-    console.log(`✅ AI Success: ${symbol}`);
+
+    const now = Date.now();
     return {
-        candles: parsed.forecast_1m.map((c, i) => ({ t: Date.now() + (i+1)*60000, close: Number(c.close) })),
+        candles: parsed.forecast_1m.map((c, i) => ({ t: now + (i+1)*60000, close: Number(c.close) })),
         target_price: Number(parsed.target_price),
         stop_loss_price: Number(parsed.stop_loss_price),
         direction: parsed.direction,
@@ -167,59 +186,119 @@ async function deepseekForecast5(symbol, contextCandles) {
   } catch (e) { return null; }
 }
 
-// --- ADAPTIVE PICKER ---
-async function pickAiWithAdaptiveGates(aiPool) {
-  const adaptiveSteps = [{ gates: { maxSpreadPct: 0.60, minDepth: 5_000, stddevMax: 0.35, backtestMean: 0.50 } }];
-  const accepted = [];
-  const pool = aiPool.slice().sort((a,b) => b.quoteVolume - a.quoteVolume).slice(0, 10);
-  const blacklist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'USDCUSDT', 'FDUSDUSDT'];
+// --- SCANNER JOB ---
+async function runScannerJob() {
+  if (scanInFlight) return;
+  scanInFlight = true;
+  console.log('\n🔍 Running 2-Stage Elite Scanner...');
 
-  for (const step of adaptiveSteps) {
-    const candidatesToCheck = [];
-    for (const t of pool) {
-        if (blacklist.includes(t.symbol)) continue; 
-        if (t.quoteVolume < MIN_QUOTEVOL_AI) continue;
-        candidatesToCheck.push(t);
+  try {
+    const all = await fetch24hrTickers();
+    if (!all) throw new Error("MEXC API Fail");
+
+    const base = all.map(x => ({ symbol: x.symbol, quoteVolume: Number(x.quoteVolume), lastPrice: Number(x.lastPrice), priceChangePercent: Number(x.priceChangePercent) }))
+        .filter(x => x.symbol.endsWith('USDT') && isSaneUsdtSymbol(x.symbol) && !isStablecoinLike(x.symbol) && !isLeveraged(x.symbol));
+
+    const baseMap = new Map(base.map(b => [b.symbol, b]));
+    const symbolsToRemove = [];
+
+    // 1. Check Active Signals
+    for (const [sym, sig] of Array.from(activeSignals.entries())) {
+        const tick = baseMap.get(sym);
+        if (!tick) continue;
+        const price = Number(tick.lastPrice);
+        let done = false;
+        if (sig.direction === 'LONG') {
+            if (price >= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+30000; done = true; }
+            else if (price <= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+30000; done = true; }
+        } else {
+            if (price <= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+30000; done = true; }
+            else if (price >= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+30000; done = true; }
+        }
+        if (done) symbolsToRemove.push(sym); else sig.price = price;
     }
-    const results = await Promise.all(candidatesToCheck.slice(0, 5).map(async (candidate) => {
-        try {
-            // Get Depth & Klines
-            const [depth, kl] = await Promise.all([
-                fetchMexcDepth(candidate.symbol, 20),
-                fetchMexcKlines(candidate.symbol, '1m', 35)
-            ]);
+    symbolsToRemove.forEach(sym => activeSignals.delete(sym));
+
+    const now = Date.now();
+
+    // 2. AI SCAN (Every 10 mins) - TWO STAGE
+    if (now >= nextAiScan && activeSignals.size < 5) {
+        console.log('🧠 Running AI Selection...');
+        nextAiScan = now + AI_INTERVAL;
+        
+        // Stage 1: Get Top 10 Candidates
+        const candidates = base
+            .filter(x => x.symbol.endsWith('USDT') && !['BTCUSDT','ETHUSDT'].includes(x.symbol) && Number(x.quoteVolume) > 1000000)
+            .sort((a,b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent))
+            .slice(0, 10);
+
+        const enriched = [];
+        for (const c of candidates) {
+            const kl = await fetchMexcKlines(c.symbol, '1m', 15);
+            if (kl.length < 15) continue;
+            const closes = kl.map(k=>Number(k[4]));
+            enriched.push({ symbol: c.symbol, price: Number(c.lastPrice), quoteVolume: Number(c.quoteVolume), rsi: calculateRSI(closes), klines: kl });
+        }
+
+        if (enriched.length > 0) {
+            console.log('🤖 Selector analyzing...');
+            const winner = await deepseekSelectWinner(enriched);
             
-            if (!kl || kl.length < 35) return null;
-            if (!depth || !depth.bids.length) return null;
+            if (winner) {
+                console.log('🏆 Winner Chosen:', winner.symbol);
+                // Stage 2: Execution
+                const signal = await deepseekExecution(winner);
+                if (signal) {
+                    activeSignals.set(winner.symbol, {
+                        symbol: winner.symbol, tag: 'AI', price: winner.price,
+                        target_price: signal.target_price, stop_loss_price: signal.stop_loss_price, direction: signal.direction,
+                        forecastCandles: signal.candles, detectedAt: Date.now(), status: 'ACTIVE',
+                        addedAt: Date.now(), stdDev: 0, quoteVolume: winner.quoteVolume, change24hPct: 0
+                    });
+                }
+            }
+        }
+    }
 
-            // Calc Spread & Depth
-            const bestBid = Number(depth.bids[0][0]);
-            const bestAsk = Number(depth.asks[0][0]);
-            const mid = (bestBid+bestAsk)/2;
-            const spreadPct = ((bestAsk-bestBid)/mid)*100;
-            let bidUSDT = 0, askUSDT = 0;
-            depth.bids.forEach(b => bidUSDT += Number(b[0])*Number(b[1]));
-            depth.asks.forEach(a => askUSDT += Number(a[0])*Number(a[1]));
-            const depthUSDT = Math.min(bidUSDT, askUSDT);
+    // 3. FT SCAN (Every 1 min)
+    if (now >= nextFtScan) {
+        nextFtScan = now + FT_INTERVAL;
+        const ftPool = base.filter(x => !activeSignals.has(x.symbol) && x.quoteVolume >= MIN_QUOTEVOL_FT).sort((a,b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent)).slice(0, 60);
+        const ftPicks = [];
+        for (let i=0; i<ftPool.length; i+=CHUNK_SIZE) {
+            const chunk = ftPool.slice(i, i+CHUNK_SIZE);
+            await Promise.all(chunk.map(async (t) => {
+                const k = await fetchMexcKlines(t.symbol, '1m', 20);
+                if(k.length < 15) return;
+                const rsi = calculateRSI(k.map(x=>Number(x[4])), 14);
+                let signal = 'NEUTRAL'; if (rsi < 35) signal = 'LONG'; if (rsi > 65) signal = 'SHORT';
+                ftPicks.push({ ...t, rsi, signal, tag: 'FT', stdDev: relStdDevPct(k.map(x=>Number(x[4]))) });
+            }));
+        }
+        const longs = ftPicks.filter(f => f.signal === 'LONG').slice(0,7);
+        const shorts = ftPicks.filter(f => f.signal === 'SHORT').slice(0,7);
+        const vols = ftPicks.filter(f => f.signal === 'NEUTRAL').slice(0,6);
+        lastFtPicks = [...longs, ...shorts, ...vols];
+        console.log(`⚡ FT Scan Done: ${lastFtPicks.length} picks`);
+    }
 
-            // AI Call
-            const ds = await deepseekForecast5(candidate.symbol, kl.map(k=>({close:Number(k[4])})));
-            if (!ds || ds.confidence < 60) return null;
+    const finalDetected = [...Array.from(activeSignals.values()), ...lastFtPicks];
+    const forecasts = {};
+    activeSignals.forEach(s => {
+        forecasts[s.symbol] = {
+            generatedAt: s.addedAt, horizonMinutes: 5, candles: s.forecastCandles,
+            target_price: s.target_price, stop_loss_price: s.stop_loss_price, direction: s.direction, status: s.status, source: 'deepseek'
+        };
+    });
 
-            // Return FULL Object (Fixing "0.0k" bug)
-            return { 
-                ...candidate, 
-                ...ds, 
-                spreadPct, 
-                depthUSDT,
-                stdDev: relStdDevPct(kl.map(k=>Number(k[4])))
-            };
-        } catch (e) { return null; }
-    }));
-    results.filter(r => r).forEach(v => accepted.push(v));
-    if (accepted.length >= 1) break; 
-  }
-  return accepted.slice(0, 2);
+    console.log(`✅ Update: AI=${activeSignals.size}`);
+
+    const payload = { ts: new Date().toISOString(), nextScanAt: nextFtScan, nextAiScan: nextAiScan, parsed: { detected: finalDetected, forecastsBySymbol: forecasts } };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(payload));
+    sseBroadcast('scheduled_update', payload);
+
+  } catch (e) { console.error(e); } 
+  finally { scanInFlight = false; setTimeout(runScannerJob, 30000); }
 }
 
 // --- DB & USER ---
@@ -255,23 +334,23 @@ const TEXTS = {
         menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Рынок", settings: "⚙️ Настройки", help: "❓ Помощь" },
         market: "🔄 Сканирую рынок...",
         premium_status: "✅ Ваш статус: PRO",
-        premium_buy: "💎 <b>VORTEX PRO</b>\n\n• AI Снайпер Сигналы\n• Без задержек\n• Полный доступ\n\n<b>Цена:</b> 1000 RUB / 1 Месяц",
+        premium_buy: "💎 **VORTEX PRO**\n\n• AI Снайпер Сигналы\n• Без задержек\n• Полный доступ\n\n**Цена:** 1000 RUB / 1 Месяц",
         pay_methods: { crypto: "💠 Крипта (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Карта РФ" },
-        disclaimer: "⚠️ <b>ЮРИДИЧЕСКИЙ ДИСКЛЕЙМЕР</b>\n\nТорговля — риск. Возврата нет.",
+        disclaimer: "⚠️ **ЮРИДИЧЕСКИЙ ДИСКЛЕЙМЕР**\n\nТорговля — риск. Возврата нет.",
         agree_pay: "✅ Согласен, Оплатить",
-        manual_pay: "💳 <b>Способ оплаты: Перевод на карту</b> 🇷🇺\n💰 <b>К оплате:</b> 1000 RUB\n\n👋 Напиши менеджеру по кнопке ниже, он выдаст реквизиты.\n\n🍇 <b>ПОСЛЕ ПЕРЕВОДА</b> — возвращайся сюда и жми кнопку <b>'✅ Я Оплатил'</b>. Затем отправляй скриншот.\n\n<i>Доступ выдаётся в течение 5 минут.</i>",
+        manual_pay: "💳 **Способ оплаты: Перевод на карту** 🇷🇺\n💰 **К оплате:** 1000 RUB\n\n👋 Напиши менеджеру по кнопке ниже, он выдаст реквизиты.\n\n🍇 **ПОСЛЕ ПЕРЕВОДА** — возвращайся сюда и жми кнопку **\"✅ Я Оплатил\"**. Затем отправляй скриншот.\n\n_Доступ выдаётся в течение 5 минут._",
         btn_manager: "📩 Написать Менеджеру",
         btn_paid: "✅ Я Оплатил",
         btn_back: "🔙 Назад",
-        settings: "⚙️ <b>Настройки</b>",
+        settings: "⚙️ **Настройки**",
         alerts: "🔔 Уведомления AI:",
         lang_btn: "🌐 Сменить Язык",
-        profile: "👤 <b>ПРОФИЛЬ</b>",
+        profile: "👤 **ПРОФИЛЬ**",
         no_sub: "❌ Нет подписки",
         days_left: "дней",
         buy_btn: "💎 Купить Premium",
-        help: "📚 <b>ПОМОЩЬ</b>\n\n• <b>AI Signals:</b> Снайперские входы от DeepSeek.\n• <b>FT:</b> Зоны перекупленности.\n\nSupport: @meanfive1",
-        app_desc: "📱 <b>Vortex Web App</b>\n\nНажмите кнопку ниже, чтобы запустить:"
+        help: "📚 **ПОМОЩЬ**\n\n• **AI Signals:** Снайперские входы от DeepSeek.\n• **FT:** Зоны перекупленности.\n\nSupport: @meanfive1",
+        app_desc: "📱 **Vortex Web App**\n\nНажмите кнопку ниже, чтобы запустить:"
     },
     en: {
         welcome: "👋 Welcome to Vortex AI!\n\nPlease subscribe to our channel to continue.",
@@ -279,25 +358,25 @@ const TEXTS = {
         sub_error: "❌ You are not subscribed.",
         lang_select: "🌐 Select Language:",
         menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Market", settings: "⚙️ Settings", help: "❓ Help" },
-        app_desc: "📱 <b>Vortex Web App</b>\n\nClick below to launch:",
+        app_desc: "📱 **Vortex Web App**\n\nClick below to launch:",
         market: "🔄 Scanning...",
         premium_status: "✅ Your Status: PRO",
-        premium_buy: "💎 <b>VORTEX PRO</b>\n\n• AI Sniper Signals\n• Zero Latency\n• Full Access\n\n<b>Price:</b> $10 / 1 Month",
+        premium_buy: "💎 **VORTEX PRO**\n\n• AI Sniper Signals\n• Zero Latency\n• Full Access\n\n**Price:** $10 / 1 Month",
         pay_methods: { crypto: "💠 Crypto (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Bank Card" },
-        disclaimer: "⚠️ <b>LEGAL DISCLAIMER</b>\n\nTrading involves risk. No refunds.",
+        disclaimer: "⚠️ **LEGAL DISCLAIMER**\n\nTrading involves risk. No refunds.",
         agree_pay: "✅ I Agree & Pay",
-        manual_pay: "💳 <b>Payment Method: Bank Card</b>\n💰 <b>Price:</b> $10\n\n👋 Contact manager below.\n\n🍇 <b>AFTER PAYMENT</b> — come back and click <b>'✅ I Paid'</b>. Then send a screenshot.\n\n<i>Access granted within 5 mins.</i>",
+        manual_pay: "💳 **Payment Method: Bank Card**\n💰 **Price:** $10\n\n👋 Contact manager below.\n\n🍇 **AFTER PAYMENT** — come back and click **\"✅ I Paid\"**. Then send a screenshot.\n\n_Access granted within 5 mins._",
         btn_manager: "📩 Contact Manager",
         btn_paid: "✅ I Paid",
         btn_back: "🔙 Back",
-        settings: "⚙️ <b>Settings</b>",
+        settings: "⚙️ **Settings**",
         alerts: "🔔 AI Alerts:",
         lang_btn: "🌐 Change Language",
-        profile: "👤 <b>PROFILE</b>",
+        profile: "👤 **PROFILE**",
         no_sub: "❌ No Subscription",
         days_left: "days",
         buy_btn: "💎 Buy Premium",
-        help: "📚 <b>HELP</b>\n\n• <b>AI Signals:</b> Sniper entries by DeepSeek.\n• <b>FT:</b> RSI Oversold/Overbought zones.\n\nSupport: @meanfive1"
+        help: "📚 **HELP**\n\n• **AI Signals:** Sniper entries by DeepSeek.\n• **FT:** RSI Oversold/Overbought zones.\n\nSupport: @meanfive1"
     }
 };
 
@@ -359,7 +438,54 @@ if (TG_BOT_TOKEN) {
             ]));
         });
 
-        // ACTIONS
+        bot.command('admin', async (ctx) => {
+            if (String(ctx.from.id) !== String(ADMIN_ID)) return; 
+            const count = await User.countDocuments();
+            const pros = await User.countDocuments({ isPremium: true });
+            ctx.reply(`👑 **ADMIN**\nTotal: ${count}\nPRO: ${pros}\n\n/give <id>\n/del <id>`);
+        });
+
+        bot.command('give', async (ctx) => {
+            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
+            const id = ctx.message.text.split(' ')[1];
+            if (id) { 
+                await activateUser(id); 
+                ctx.reply(`✅ Given PRO to ${id}`);
+                try { await bot.telegram.sendMessage(id, '🎉 **Admin granted you Premium!** Restart app.'); } catch(e){}
+            } else {
+                ctx.reply('Usage: /give 12345678');
+            }
+        });
+
+        bot.command('del', async (ctx) => {
+            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
+            const id = ctx.message.text.split(' ')[1];
+            if (id) { 
+                await User.findOneAndUpdate({ tgId: String(id) }, { isPremium: false });
+                ctx.reply(`❌ Removed PRO from ${id}`); 
+            }
+        });
+
+        bot.command('force', async (ctx) => {
+            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
+            const sym = (ctx.message.text.split(' ')[1] || 'DOGEUSDT').toUpperCase();
+            
+            const k = await fetchMexcKlines(sym, '1m', 50);
+            if (!k.length) return ctx.reply('Symbol not found');
+            const price = Number(k[k.length-1][4]);
+            
+            // Mock Signal
+            const signal = {
+                symbol: sym, tag: 'AI', price,
+                target_price: price * 1.002, stop_loss_price: price * 0.998, direction: 'LONG',
+                forecastCandles: [], detectedAt: Date.now(), status: 'ACTIVE', addedAt: Date.now(),
+                stdDev: 0, quoteVolume: 1000000, spreadPct: 0.01, source: 'deepseek'
+            };
+            
+            activeSignals.set(sym, signal);
+            ctx.reply(`✅ Forced ${sym}`);
+        });
+
         bot.action(/^lang_(.+)$/, async (ctx) => {
             const lang = ctx.match[1];
             await User.findOneAndUpdate({ tgId: String(ctx.from.id) }, { language: lang }, { upsert: true });
@@ -485,45 +611,6 @@ if (TG_BOT_TOKEN) {
             ctx.reply(T.help, { parse_mode: 'HTML' });
         });
 
-        bot.command('admin', async (ctx) => {
-            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
-            const count = await User.countDocuments();
-            const pros = await User.countDocuments({ isPremium: true });
-            ctx.reply(`👑 **ADMIN**\nTotal: ${count}\nPRO: ${pros}\n\n/give <id>\n/del <id>`);
-        });
-
-        bot.command('give', async (ctx) => {
-            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
-            const id = ctx.message.text.split(' ')[1];
-            if (id) { await activateUser(id); ctx.reply(`✅ Given to ${id}`); }
-        });
-
-        bot.command('del', async (ctx) => {
-            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
-            const id = ctx.message.text.split(' ')[1];
-            if (id) { await User.findOneAndUpdate({ tgId: String(id) }, { isPremium: false }); ctx.reply(`❌ Removed from ${id}`); }
-        });
-
-        bot.command('force', async (ctx) => {
-            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
-            const sym = (ctx.message.text.split(' ')[1] || 'DOGEUSDT').toUpperCase();
-            
-            const k = await fetchMexcKlines(sym, '1m', 50);
-            if (!k.length) return ctx.reply('Symbol not found');
-            const price = Number(k[k.length-1][4]);
-            
-            // Mock Signal
-            const signal = {
-                symbol: sym, tag: 'AI', price,
-                target_price: price * 1.002, stop_loss_price: price * 0.998, direction: 'LONG',
-                forecastCandles: [], detectedAt: Date.now(), status: 'ACTIVE', addedAt: Date.now(),
-                stdDev: 0, quoteVolume: 1000000, spreadPct: 0.01, source: 'deepseek', depthUSDT: 50000
-            };
-            
-            activeSignals.set(sym, signal);
-            ctx.reply(`✅ Forced ${sym}`);
-        });
-
         bot.launch().then(() => console.log('🤖 Bot Started'));
         
         process.once('SIGINT', () => bot.stop('SIGINT'));
@@ -532,92 +619,10 @@ if (TG_BOT_TOKEN) {
     } catch(e) { console.error('Bot Error:', e); }
 }
 
-// --- SCANNER JOB (DUAL) ---
-async function runScannerJob() {
-  if (scanInFlight) return;
-  scanInFlight = true;
-  const now = Date.now();
-
-  try {
-    const all = await fetch24hrTickers();
-    if (!all) throw new Error("MEXC API Fail");
-    
-    // 1. FT SCAN (Every 1 min)
-    if (now >= nextFtScan) {
-        console.log('⚡ Running FT Scan...');
-        nextFtScan = now + FT_INTERVAL;
-        const base = all.filter(x => x.symbol.endsWith('USDT') && Number(x.quoteVolume) > MIN_QUOTEVOL_FT).map(x => ({ ...x, lastPrice: Number(x.lastPrice), quoteVolume: Number(x.quoteVolume), priceChangePercent: Number(x.priceChangePercent) }));
-        const ftPool = base.filter(x => !activeSignals.has(x.symbol)).sort((a,b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent)).slice(0, 60);
-        const ftPicks = [];
-        for (let i=0; i<ftPool.length; i+=CHUNK_SIZE) {
-            const chunk = ftPool.slice(i, i+CHUNK_SIZE);
-            await Promise.all(chunk.map(async (t) => {
-                const k = await fetchMexcKlines(t.symbol, '1m', 20);
-                if(k.length < 15) return;
-                const rsi = calculateRSI(k.map(x=>Number(x[4])), 14);
-                let signal = 'NEUTRAL'; if (rsi < 35) signal = 'LONG'; if (rsi > 65) signal = 'SHORT';
-                ftPicks.push({ ...t, rsi, signal, tag: 'FT', stdDev: relStdDevPct(k.map(x=>Number(x[4]))) });
-            }));
-        }
-        lastFtPicks = ftPicks.slice(0, 20); 
-    }
-
-    // 2. AI SCAN (Every 10 mins)
-    if (now >= nextAiScan) {
-        console.log('🧠 Running AI Scan...');
-        nextAiScan = now + AI_INTERVAL;
-        
-        for (const [sym, sig] of activeSignals) {
-            if (sig.removeAt && now > sig.removeAt) activeSignals.delete(sym);
-        }
-
-        if (activeSignals.size < 5) {
-            const aiPool = all.filter(x => x.symbol.endsWith('USDT') && Number(x.quoteVolume) > MIN_QUOTEVOL_AI).map(x => ({ ...x, lastPrice: Number(x.lastPrice), quoteVolume: Number(x.quoteVolume) }));
-            const newPicks = await pickAiWithAdaptiveGates(aiPool);
-            newPicks.forEach(p => {
-                if (!activeSignals.has(p.symbol)) {
-                    activeSignals.set(p.symbol, { ...p, tag: 'AI', detectedAt: now, status: 'ACTIVE', addedAt: now });
-                    notifyProUsers(`🚨 NEW SIGNAL: ${p.symbol} ${p.direction}!\nTarget: ${p.target_price}`);
-                }
-            });
-        }
-    }
-
-    // 3. UPDATE ACTIVE SIGNALS PRICES
-    const baseMap = new Map(all.map(x => [x.symbol, x]));
-    for (const [sym, sig] of activeSignals.entries()) {
-        const tick = baseMap.get(sym);
-        if (!tick) continue;
-        const price = Number(tick.lastPrice);
-        
-        if (sig.status === 'ACTIVE') {
-            if (sig.direction === 'LONG') {
-                if (price >= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+30000; }
-                else if (price <= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+30000; }
-            } else {
-                if (price <= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+30000; }
-                else if (price >= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+30000; }
-            }
-            sig.price = price;
-        }
-    }
-
-    // Save
-    const finalDetected = [...Array.from(activeSignals.values()), ...lastFtPicks];
-    const forecasts = {};
-    activeSignals.forEach(s => { forecasts[s.symbol] = { generatedAt: s.addedAt, horizonMinutes: 5, candles: s.forecastCandles, target_price: s.target_price, stop_loss_price: s.stop_loss_price, direction: s.direction, status: s.status, source: 'deepseek' }; });
-    const payload = { ts: new Date().toISOString(), nextScanAt: nextFtScan, nextAiScan: nextAiScan, parsed: { detected: finalDetected, forecastsBySymbol: forecasts } };
-    try { fs.writeFileSync(DATA_FILE, JSON.stringify(payload)); sseBroadcast('scheduled_update', payload); } catch(e){}
-
-  } catch (e) { console.error(e); } 
-  finally { scanInFlight = false; setTimeout(runScannerJob, 30000); }
-}
-
 // --- INIT ---
 app.use(express.static(path.join(__dirname, '../dist')));
 app.get('*', (req, res) => { if (!req.path.startsWith('/api')) res.sendFile(path.join(__dirname, '../dist/index.html')); });
 app.listen(PORT, () => { 
-    nextFtScan = Date.now(); nextAiScan = Date.now(); 
     try { loadPersistedSignals(); } catch(e){} 
     console.log(`🚀 Server on ${PORT}`); 
     runScannerJob(); 
