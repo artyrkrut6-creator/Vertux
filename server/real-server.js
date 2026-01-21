@@ -21,14 +21,15 @@ if (PROXY_URL) {
   try { agent = new HttpsProxyAgent(PROXY_URL); } catch (_) {}
 }
 
-// --- CONSTANTS ---
-const MIN_PRICE_FT = 0.02;
-const MIN_PRICE_AI = 0.10;
-const MIN_QUOTEVOL_FT = 700_000;
-const MIN_QUOTEVOL_AI = 1_500_000;
-const MAX_SPREAD_FT_PCT = 0.50;
+// --- CONSTANTS (RELAXED) ---
+const MIN_PRICE_FT = 0.01; // Was 0.02
+const MIN_PRICE_AI = 0.05; // Was 0.10
+const MIN_QUOTEVOL_FT = 500_000;
+const MIN_QUOTEVOL_AI = 1_000_000; // Was 2.5M
+const MAX_SPREAD_FT_PCT = 0.80;
 const MAX_SPREAD_AI_PCT = 0.60;
-const MIN_DEPTH_FT_USDT = 10_000;
+const DEPTH_BAND_PCT = 0.20; 
+const MIN_DEPTH_FT_USDT = 5_000;
 const MIN_DEPTH_AI_USDT = 5_000;
 const BACKTEST_KLINES = 40;
 const CHUNK_SIZE = 20; 
@@ -111,100 +112,42 @@ function calculateRSI(closes, period=14) {
   return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
-function detectPattern(klines) {
-    if (klines.length < 5) return null;
-    const input = {
-        open: klines.map(k=>Number(k[1])),
-        high: klines.map(k=>Number(k[2])),
-        low: klines.map(k=>Number(k[3])),
-        close: klines.map(k=>Number(k[4])),
-    };
-    if (BullishEngulfing.hasPattern(input)) return "Bullish Engulfing";
-    if (BearishEngulfing.hasPattern(input)) return "Bearish Engulfing";
-    if (Hammer.hasPattern(input)) return "Hammer";
-    if (ShootingStar.hasPattern(input)) return "Shooting Star";
-    const bb = BollingerBands.calculate({period: 20, stdDev: 2, values: input.close});
-    if (bb.length > 0) {
-        const last = bb[bb.length-1];
-        if ((last.upper - last.lower) / (last.middle || 1) < 0.015) return "Bollinger Squeeze";
-    }
-    return null;
-}
-
-// --- DEEPSEEK (WITH FALLBACK) ---
+// --- DEEPSEEK ---
 async function deepseekForecast5(symbol, contextCandles) {
-  const lastClose = contextCandles[contextCandles.length-1].close;
-  
-  // 1. Try DeepSeek
-  if (SILICON_KEY) {
-      try {
-        console.log(`🤖 AI Request: ${symbol}`);
-        const controller = new AbortController();
-        const id = setTimeout(() => controller.abort(), 20000); 
-        
-        const system = `You are Vortex AI. Output JSON: { "target_price": number, "stop_loss_price": number, "direction": "LONG"|"SHORT", "confidence": 0-100, "forecast_1m": [ ...5 candles... ] }`;
-        const user = `Symbol: ${symbol}. Last close: ${lastClose}. Predict now.`;
-
-        const r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
-          method: 'POST', headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: 'deepseek-ai/DeepSeek-V3', messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0.1, response_format: { type: 'json_object' } }),
-          signal: controller.signal
-        });
-        clearTimeout(id);
-
-        if (r.ok) {
-            const j = await r.json();
-            let content = j?.choices?.[0]?.message?.content || '{}';
-            if (content.includes('```json')) content = content.split('```json')[1].split('```')[0].trim();
-            const parsed = JSON.parse(content);
-            if (parsed.target_price) {
-                console.log(`✅ AI Success: ${symbol} Target=${parsed.target_price}`);
-                return {
-                    candles: parsed.forecast_1m.map((c, i) => ({ t: Date.now() + (i+1)*60000, close: Number(c.close) })),
-                    target_price: Number(parsed.target_price),
-                    stop_loss_price: Number(parsed.stop_loss_price),
-                    direction: parsed.direction,
-                    confidence: Number(parsed.confidence),
-                    source: 'deepseek'
-                };
-            }
-        }
-      } catch (e) { console.log(`❌ AI Fail: ${e.message}`); }
-  }
-
-  // 2. FALLBACK: TECHNICAL FORECAST (Bollinger Bands)
-  // If AI fails, we generate a technical target to keep the app running.
-  console.log(`⚠️ Using Technical Fallback for ${symbol}`);
-  
-  const bbInput = { period: 20, stdDev: 2, values: contextCandles.map(c=>c.close) };
-  const bb = BollingerBands.calculate(bbInput);
-  const lastBB = bb[bb.length-1];
-  
-  // Logic: If close < mid -> Long to Upper. If close > mid -> Short to Lower.
-  const direction = lastClose < lastBB.middle ? 'LONG' : 'SHORT';
-  const target = direction === 'LONG' ? lastBB.upper : lastBB.lower;
-  const stop = direction === 'LONG' ? lastBB.lower : lastBB.upper;
-  
-  // Generate smooth path
-  const candles = [];
-  for(let i=1; i<=5; i++) {
-      const p = lastClose + (target - lastClose) * (i/5);
-      candles.push({ t: Date.now() + i*60000, close: p });
-  }
-
-  return {
-      candles,
-      target_price: Number(target.toFixed(8)),
-      stop_loss_price: Number(stop.toFixed(8)),
-      direction,
-      confidence: 80, // Technical confidence
-      source: 'deepseek' // Cheat source to show lines
-  };
+  if (!SILICON_KEY) return null;
+  const system = `You are Vortex AI. Find a sniper entry point on MEXC.
+TASK: Analyze 50 candles. Determine direction (LONG/SHORT). Calculate TARGET PRICE and STOP LOSS.
+JSON OUTPUT FORMAT: { "target_price": number, "stop_loss_price": number, "direction": "LONG"|"SHORT", "confidence": 0-100, "forecast_1m": [ ... ] }`;
+  const user = `Symbol: ${symbol}. Last close: ${contextCandles[contextCandles.length-1].close}. Predict now.`;
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), 25000); 
+  try {
+    const r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
+      method: 'POST', headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-ai/DeepSeek-V3', messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0.1, response_format: { type: 'json_object' } }),
+      signal: controller.signal
+    });
+    clearTimeout(id);
+    if (!r.ok) return null;
+    const j = await r.json();
+    let content = j?.choices?.[0]?.message?.content || '{}';
+    if (content.includes('```json')) content = content.split('```json')[1].split('```')[0].trim();
+    const parsed = JSON.parse(content);
+    if (!parsed.target_price) return null;
+    return {
+        candles: parsed.forecast_1m.map((c, i) => ({ t: Date.now() + (i+1)*60000, close: Number(c.close) })),
+        target_price: Number(parsed.target_price),
+        stop_loss_price: Number(parsed.stop_loss_price),
+        direction: parsed.direction,
+        confidence: Number(parsed.confidence),
+        source: 'deepseek'
+    };
+  } catch (e) { return null; }
 }
 
 // --- ADAPTIVE PICKER ---
 async function pickAiWithAdaptiveGates(aiPool) {
-  // Relaxed: Spread 0.60, Depth 5k, StdDev 0.35, Backtest 0.50
+  // Relaxed: Spread 0.60, Depth 5k, StdDev 0.35
   const adaptiveSteps = [{ gates: { maxSpreadPct: 0.60, minDepth: 5_000, stddevMax: 0.35, backtestMean: 0.50 } }];
   const accepted = [];
   const pool = aiPool.slice().sort((a,b) => b.quoteVolume - a.quoteVolume).slice(0, 10);
@@ -221,15 +164,9 @@ async function pickAiWithAdaptiveGates(aiPool) {
         try {
             const kl = await fetchMexcKlines(candidate.symbol, '1m', 35);
             if (kl.length < 35) return null;
-            const pattern = detectPattern(kl);
-            
-            // If pattern found OR volume huge -> Try Forecast
-            if (pattern || candidate.quoteVolume > 5000000) {
-                const ds = await deepseekForecast5(candidate.symbol, kl.map(k=>({close:Number(k[4])})));
-                if (!ds) return null;
-                return { ...candidate, ...ds };
-            }
-            return null;
+            const ds = await deepseekForecast5(candidate.symbol, kl.map(k=>({close:Number(k[4])})));
+            if (!ds || ds.confidence < 60) return null; // Lowered confidence req
+            return { ...candidate, ...ds };
         } catch (e) { return null; }
     }));
     results.filter(r => r).forEach(v => accepted.push(v));
@@ -262,7 +199,6 @@ async function checkUser(id) {
 
 let notifyProUsers = async (message) => { console.log('[notifyProUsers] noop', message); };
 
-// --- TEXTS ---
 const TEXTS = {
     ru: {
         welcome: "👋 Добро пожаловать в Vortex AI!\n\nПожалуйста, подпишитесь на наш канал, чтобы продолжить.",
@@ -272,23 +208,23 @@ const TEXTS = {
         menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Рынок", settings: "⚙️ Настройки", help: "❓ Помощь" },
         market: "🔄 Сканирую рынок...",
         premium_status: "✅ Ваш статус: PRO",
-        premium_buy: "💎 **VORTEX PRO**\n\n• AI Снайпер Сигналы\n• Без задержек\n• Полный доступ\n\n**Цена:** 1000 RUB / 1 Месяц",
+        premium_buy: "💎 <b>VORTEX PRO</b>\n\n• AI Снайпер Сигналы\n• Без задержек\n• Полный доступ\n\n<b>Цена:</b> 1000 RUB / 1 Месяц",
         pay_methods: { crypto: "💠 Крипта (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Карта РФ" },
-        disclaimer: "⚠️ **ЮРИДИЧЕСКИЙ ДИСКЛЕЙМЕР**\n\n1. **Риски:** Торговля криптовалютой сопряжена с высоким риском. Вы можете потерять вложения.\n2. **Гарантии:** Сигналы Vortex AI — это прогнозы, а не финансовые советы. Мы не гарантируем прибыль.\n3. **Возврат:** Средства за подписку не возвращаются.\n\nНажимая кнопку оплаты, вы соглашаетесь с этими условиями.",
+        disclaimer: "⚠️ <b>ЮРИДИЧЕСКИЙ ДИСКЛЕЙМЕР</b>\n\n1. <b>Риски:</b> Торговля криптовалютой сопряжена с высоким риском. Вы можете потерять вложения.\n2. <b>Гарантии:</b> Сигналы Vortex AI — это прогнозы, а не финансовые советы. Мы не гарантируем прибыль.\n3. <b>Возврат:</b> Средства за подписку не возвращаются.\n\nНажимая кнопку оплаты, вы соглашаетесь с этими условиями.",
         agree_pay: "✅ Согласен, Оплатить",
-        manual_pay: "💳 **Способ оплаты: Перевод на карту** 🇷🇺\n💰 **К оплате:** 1000 RUB\n\n👋 Напиши менеджеру по кнопке ниже, он выдаст реквизиты.\n\n🍇 **ПОСЛЕ ПЕРЕВОДА** — возвращайся сюда и жми кнопку **\"✅ Я Оплатил\"**. Затем отправляй скриншот.\n\n_Доступ выдаётся в течение 5 минут._",
+        manual_pay: "💳 <b>Способ оплаты: Перевод на карту</b> 🇷🇺\n💰 <b>К оплате:</b> 1000 RUB\n\n👋 Напиши менеджеру по кнопке ниже, он выдаст реквизиты.\n\n🍇 <b>ПОСЛЕ ПЕРЕВОДА</b> — возвращайся сюда и жми кнопку <b>'✅ Я Оплатил'</b>. Затем отправляй скриншот.\n\n<i>Доступ выдаётся в течение 5 минут.</i>",
         btn_manager: "📩 Написать Менеджеру",
         btn_paid: "✅ Я Оплатил",
         btn_back: "🔙 Назад",
-        settings: "⚙️ **Настройки**",
+        settings: "⚙️ <b>Настройки</b>",
         alerts: "🔔 Уведомления AI:",
         lang_btn: "🌐 Сменить Язык",
-        profile: "👤 **ПРОФИЛЬ**",
+        profile: "👤 <b>ПРОФИЛЬ</b>",
         no_sub: "❌ Нет подписки",
         days_left: "дней",
         buy_btn: "💎 Купить Premium",
-        help: "📚 **ПОМОЩЬ**\n\n• **AI Signals:** Снайперские входы от DeepSeek.\n• **FT:** Зоны перекупленности/перепроданности.\n\nSupport: @meanfive1",
-        app_desc: "📱 **Vortex Web App**\n\nНажмите кнопку ниже, чтобы запустить:"
+        help: "📚 <b>ПОМОЩЬ</b>\n\n• <b>AI Signals:</b> Снайперские входы от DeepSeek.\n• <b>FT:</b> Зоны перекупленности/перепроданности.\n\nSupport: @meanfive1",
+        app_desc: "📱 <b>Vortex Web App</b>\n\nНажмите кнопку ниже, чтобы запустить:"
     },
     en: {
         welcome: "👋 Welcome to Vortex AI!\n\nPlease subscribe to our channel to continue.",
@@ -296,29 +232,28 @@ const TEXTS = {
         sub_error: "❌ You are not subscribed. Please join to use the bot.",
         lang_select: "🌐 Select Language:",
         menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Market", settings: "⚙️ Settings", help: "❓ Help" },
-        app_desc: "📱 **Vortex Web App**\n\nClick below to launch:",
+        app_desc: "📱 <b>Vortex Web App</b>\n\nClick below to launch:",
         market: "🔄 Scanning...",
         premium_status: "✅ Your Status: PRO",
-        premium_buy: "💎 **VORTEX PRO**\n\n• AI Sniper Signals\n• Zero Latency\n• Full Access\n\n**Price:** $10 / 1 Month",
+        premium_buy: "💎 <b>VORTEX PRO</b>\n\n• AI Sniper Signals\n• Zero Latency\n• Full Access\n\n<b>Price:</b> $10 / 1 Month",
         pay_methods: { crypto: "💠 Crypto (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Bank Card" },
-        disclaimer: "⚠️ **LEGAL DISCLAIMER**\n\n1. **Risk:** Crypto trading involves high risk. You may lose your investment.\n2. **No Guarantees:** Vortex AI signals are forecasts, NOT financial advice.\n3. **No Refunds:** All sales are final.\n\nBy clicking pay, you agree to these terms.",
+        disclaimer: "⚠️ <b>LEGAL DISCLAIMER</b>\n\n1. <b>Risk:</b> Crypto trading involves high risk. You may lose your investment.\n2. <b>No Guarantees:</b> Vortex AI signals are forecasts, NOT financial advice.\n3. <b>No Refunds:</b> All sales are final.\n\nBy clicking pay, you agree to these terms.",
         agree_pay: "✅ I Agree & Pay",
-        manual_pay: "💳 **Payment Method: Bank Card**\n💰 **Price:** $10\n\n👋 Contact manager below for details.\n\n🍇 **AFTER PAYMENT** — come back and click **\"✅ I Paid\"**. Then send a screenshot.\n\n_Access granted within 5 mins._",
+        manual_pay: "💳 <b>Payment Method: Bank Card</b>\n💰 <b>Price:</b> $10\n\n👋 Contact manager below for details.\n\n🍇 <b>AFTER PAYMENT</b> — come back and click <b>'✅ I Paid'</b>. Then send a screenshot.\n\n<i>Access granted within 5 mins.</i>",
         btn_manager: "📩 Contact Manager",
         btn_paid: "✅ I Paid",
         btn_back: "🔙 Back",
-        settings: "⚙️ **Settings**",
+        settings: "⚙️ <b>Settings</b>",
         alerts: "🔔 AI Alerts:",
         lang_btn: "🌐 Change Language",
-        profile: "👤 **PROFILE**",
+        profile: "👤 <b>PROFILE</b>",
         no_sub: "❌ No Subscription",
         days_left: "days",
         buy_btn: "💎 Buy Premium",
-        help: "📚 **HELP**\n\n• **AI Signals:** Sniper entries by DeepSeek.\n• **FT:** RSI Oversold/Overbought zones.\n\nSupport: @meanfive1"
+        help: "📚 <b>HELP</b>\n\n• <b>AI Signals:</b> Sniper entries by DeepSeek.\n• <b>FT:</b> RSI Oversold/Overbought zones.\n\nSupport: @meanfive1"
     }
 };
 
-// --- TELEGRAM BOT ---
 if (TG_BOT_TOKEN) {
     try {
         const bot = new Telegraf(TG_BOT_TOKEN);
@@ -369,6 +304,7 @@ if (TG_BOT_TOKEN) {
           } catch (e) { console.warn('Notify Error:', e); }
         };
 
+        // COMMANDS
         bot.command('start', async (ctx) => {
             await ctx.reply('🌐 Choose language / Выберите язык', Markup.inlineKeyboard([
                 Markup.button.callback('🇷🇺 Русский', 'lang_ru'),
@@ -376,6 +312,28 @@ if (TG_BOT_TOKEN) {
             ]));
         });
 
+        // FORCE AI (ADMIN ONLY)
+        bot.command('force', async (ctx) => {
+            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
+            const sym = (ctx.message.text.split(' ')[1] || 'DOGEUSDT').toUpperCase();
+            
+            const k = await fetchMexcKlines(sym, '1m', 50);
+            if (!k.length) return ctx.reply('Symbol not found');
+            const price = Number(k[k.length-1][4]);
+            
+            // Mock Signal
+            const signal = {
+                symbol: sym, tag: 'AI', price,
+                target_price: price * 1.002, stop_loss_price: price * 0.998, direction: 'LONG',
+                forecastCandles: [], detectedAt: Date.now(), status: 'ACTIVE', addedAt: Date.now(),
+                stdDev: 0, quoteVolume: 1000000, spreadPct: 0.01, source: 'deepseek'
+            };
+            
+            activeSignals.set(sym, signal);
+            ctx.reply(`✅ Forced ${sym}`);
+        });
+
+        // ACTIONS
         bot.action(/^lang_(.+)$/, async (ctx) => {
             const lang = ctx.match[1];
             await User.findOneAndUpdate({ tgId: String(ctx.from.id) }, { language: lang }, { upsert: true });
@@ -389,7 +347,7 @@ if (TG_BOT_TOKEN) {
 
         bot.hears([/🚀 Vortex App/, /🚀 Открыть Терминал/, /App/, /Terminal/], async (ctx) => {
             const T = await getT(ctx);
-            ctx.reply(T.app_desc, Markup.inlineKeyboard([Markup.button.webApp(T.menu.app, WEBAPP_URL)]));
+            ctx.reply(T.app_desc, { parse_mode: 'HTML', ...Markup.inlineKeyboard([Markup.button.webApp(T.menu.app, WEBAPP_URL)]) });
         });
 
         bot.hears([/👤 Профиль/, /👤 Profile/], async (ctx) => {
@@ -401,21 +359,21 @@ if (TG_BOT_TOKEN) {
                 const days = Math.ceil((u.expiresAt - Date.now()) / (1000 * 60 * 60 * 24));
                 statusText = `PRO (${days} ${T.days_left})`;
             }
-            ctx.reply(`${T.profile}\n\n🆔 ID: \`${ctx.from.id}\`\n👤 User: @${ctx.from.username}\n💎 Status: ${statusText}`, { parse_mode: 'Markdown' });
+            ctx.reply(`${T.profile}\n\n🆔 ID: <code>${ctx.from.id}</code>\n👤 User: @${ctx.from.username}\n💎 Status: ${statusText}`, { parse_mode: 'HTML' });
         });
 
         bot.hears([/⚙️ Настройки/, /⚙️ Settings/], async (ctx) => {
             const T = await getT(ctx);
             const u = await User.findOne({ tgId: String(ctx.from.id) });
             const s = u?.notificationsEnabled ? '✅ ON' : '❌ OFF';
-            ctx.reply(`${T.settings}\n\n${T.alerts} ${s}`, Markup.inlineKeyboard([
+            ctx.reply(`${T.settings}\n\n${T.alerts} ${s}`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([
                 [Markup.button.callback(T.lang_btn, 'change_lang')],
                 [Markup.button.callback('Toggle Alerts', 'toggle_alerts')]
-            ]));
+            ])});
         });
 
         bot.action('change_lang', (ctx) => {
-            ctx.reply('🌐 Choose language / Выберите язык', Markup.inlineKeyboard([
+            ctx.reply('🌐 Choose language:', Markup.inlineKeyboard([
                 Markup.button.callback('🇷🇺 Русский', 'lang_ru'),
                 Markup.button.callback('🇺🇸 English', 'lang_en')
             ]));
@@ -433,12 +391,12 @@ if (TG_BOT_TOKEN) {
             const T = await getT(ctx);
             const u = await checkUser(ctx.from.id);
             if (u) return ctx.reply('✅ You are PRO.');
-            await ctx.reply(T.disclaimer, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback(T.agree_pay, 'show_pay')]]) });
+            await ctx.reply(T.disclaimer, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback(T.agree_pay, 'show_pay')]]) });
         });
 
         bot.action('show_pay', async (ctx) => {
             const T = await getT(ctx);
-            ctx.editMessageText(T.premium_buy, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
+            ctx.editMessageText(T.premium_buy, { parse_mode: 'HTML', ...Markup.inlineKeyboard([
                 [Markup.button.callback(T.pay_methods.card, 'pay_manager')],
                 [Markup.button.callback(T.pay_methods.crypto, 'pay_manager')],
                 [Markup.button.callback(T.pay_methods.stars, 'pay_stars')]
@@ -449,7 +407,7 @@ if (TG_BOT_TOKEN) {
             const T = await getT(ctx);
             const msg = T.language === 'en' ? 'Hello, I want to buy Premium.' : 'Привет, нужны реквизиты для оплаты переводом на карту.';
             const link = `https://t.me/${MANAGER_USERNAME}?text=${encodeURIComponent(msg)}`;
-            ctx.editMessageText(T.manual_pay, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
+            ctx.editMessageText(T.manual_pay, { parse_mode: 'HTML', ...Markup.inlineKeyboard([
                 [Markup.button.url(T.btn_manager, link)],
                 [Markup.button.callback(T.btn_paid, 'paid_manual')],
                 [Markup.button.callback(T.btn_back, 'show_pay')]
@@ -469,7 +427,7 @@ if (TG_BOT_TOKEN) {
                 await ctx.reply('⏳ Verifying...');
                 await bot.telegram.sendPhoto(ADMIN_ID, ctx.message.photo[ctx.message.photo.length - 1].file_id, {
                     caption: `💰 Payment from ${ctx.from.first_name} (ID: ${ctx.from.id})`,
-                    ...Markup.inlineKeyboard([Markup.button.callback('✅ Approve', `approve_${ctx.from.id}`), Markup.button.callback('❌ Reject', `reject_${ctx.from.id}`)])
+                    ...Markup.inlineKeyboard([Markup.button.callback('✅', `approve_${ctx.from.id}`), Markup.button.callback('❌', `reject_${ctx.from.id}`)])
                 });
             }
         });
@@ -482,8 +440,7 @@ if (TG_BOT_TOKEN) {
         });
 
         bot.action(/^reject_(\d+)$/, async (ctx) => {
-            const userId = ctx.match[1];
-            await bot.telegram.sendMessage(userId, '❌ Payment Rejected.');
+            await bot.telegram.sendMessage(ctx.match[1], '❌ Payment Rejected.');
             ctx.editMessageCaption(ctx.callbackQuery.message.caption + '\n\n❌ REJECTED');
         });
 
@@ -493,44 +450,14 @@ if (TG_BOT_TOKEN) {
 
         bot.hears(/📊 Market|📊 Рынок/, async (ctx) => {
             const T = await getT(ctx);
-            const msg = await ctx.reply(T.market);
-            try {
-                const all = await fetch24hrTickers();
-                if (!all) throw new Error('API Fail');
-                
-                // Get fresh data
-                const btc = all.find(x => x.symbol === 'BTCUSDT');
-                const gainers = all
-                    .filter(x => x.symbol.endsWith('USDT') && Number(x.quoteVolume) > 1000000)
-                    .sort((a,b) => Number(b.priceChangePercent) - Number(a.priceChangePercent))
-                    .slice(0, 3);
-                const losers = all
-                    .filter(x => x.symbol.endsWith('USDT') && Number(x.quoteVolume) > 1000000)
-                    .sort((a,b) => Number(a.priceChangePercent) - Number(b.priceChangePercent))
-                    .slice(0, 3);
-
-                let text = `📉 <b>MARKET OVERVIEW</b>\n\n`;
-                text += `🟠 <b>BTC:</b> $${Number(btc.lastPrice).toFixed(0)} (${Number(btc.priceChangePercent).toFixed(2)}%)\n\n`;
-                
-                text += `🚀 <b>Top Gainers:</b>\n`;
-                gainers.forEach(c => text += `• ${c.symbol.replace('USDT','')}: +${Number(c.priceChangePercent).toFixed(1)}%\n`);
-                
-                text += `\n🩸 <b>Top Losers:</b>\n`;
-                losers.forEach(c => text += `• ${c.symbol.replace('USDT','')}: ${Number(c.priceChangePercent).toFixed(1)}%\n`);
-
-                ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, text, { parse_mode: 'HTML' });
-            } catch (e) { 
-                ctx.deleteMessage(msg.message_id); 
-                ctx.reply('⚠️ Market data unavailable');
-            }
+            ctx.reply(T.market);
         });
 
         bot.hears(/❓ Help|❓ Помощь/, async (ctx) => {
             const T = await getT(ctx);
-            ctx.reply(T.help, { parse_mode: 'Markdown' });
+            ctx.reply(T.help, { parse_mode: 'HTML' });
         });
 
-        // Admin
         bot.command('admin', async (ctx) => {
             if (String(ctx.from.id) !== String(ADMIN_ID)) return;
             const count = await User.countDocuments();
@@ -551,13 +478,14 @@ if (TG_BOT_TOKEN) {
         });
 
         bot.launch().then(() => console.log('🤖 Bot Started'));
+        
         process.once('SIGINT', () => bot.stop('SIGINT'));
         process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
     } catch(e) { console.error('Bot Error:', e); }
 }
 
-// --- SCANNER JOB (UNCHANGED) ---
+// --- SCANNER JOB ---
 function loadPersistedSignals() {
   try {
     if (!fs.existsSync(DATA_FILE)) return;
@@ -591,15 +519,23 @@ async function runScannerJob() {
         if (!tick) continue;
         const price = Number(tick.lastPrice);
         
+        // AUTO-REMOVE ON HIT
         let done = false;
         if (sig.direction === 'LONG') {
-            if (price >= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+60000; done = true; }
-            else if (price <= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+60000; done = true; }
+            if (price >= sig.target_price) { sig.status = 'WON'; done = true; }
+            else if (price <= sig.stop_loss_price) { sig.status = 'LOST'; done = true; }
         } else {
-            if (price <= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+60000; done = true; }
-            else if (price >= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+60000; done = true; }
+            if (price <= sig.target_price) { sig.status = 'WON'; done = true; }
+            else if (price >= sig.stop_loss_price) { sig.status = 'LOST'; done = true; }
         }
-        if (done) symbolsToRemove.push(sym); else sig.price = price;
+        
+        // Remove from list if hit (will be cleared in next broadcast)
+        if (done) {
+            sig.removeAt = Date.now(); // Mark as immediate removal
+            symbolsToRemove.push(sym);
+        } else {
+            sig.price = price;
+        }
     }
     symbolsToRemove.forEach(sym => activeSignals.delete(sym));
 
