@@ -26,11 +26,6 @@ const MIN_PRICE_FT = 0.02;
 const MIN_PRICE_AI = 0.10;
 const MIN_QUOTEVOL_FT = 700_000;
 const MIN_QUOTEVOL_AI = 1_500_000;
-const MAX_SPREAD_FT_PCT = 0.50;
-const MAX_SPREAD_AI_PCT = 0.60;
-const MIN_DEPTH_FT_USDT = 10_000;
-const MIN_DEPTH_AI_USDT = 5_000;
-const BACKTEST_KLINES = 40;
 const CHUNK_SIZE = 20; 
 const UI_INTERVAL = 300_000; 
 const PRE_WORK_TIME = 45_000;
@@ -87,11 +82,10 @@ function isLeveraged(sym) { return /(3L|3S|5L|5S|UP|DOWN|BULL|BEAR)USDT$/.test(s
 function isTokenizedStock(sym) { return /ONUSDT$/.test(sym); }
 
 function relStdDevPct(closes) {
-  if (!closes.length) return 0;
+  if (!closes.length) return 999;
   const mean = closes.reduce((s,v)=>s+v,0)/closes.length;
-  if (!mean) return 0;
-  const variance = closes.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / closes.length;
-  return (Math.sqrt(variance) / mean) * 100;
+  if (!mean) return 999;
+  return (Math.sqrt(closes.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / closes.length) / mean) * 100;
 }
 
 function calculateRSI(closes, period=14) {
@@ -112,140 +106,97 @@ function calculateRSI(closes, period=14) {
   return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
-function detectPattern(klines) {
-    if (klines.length < 5) return null;
-    const input = {
-        open: klines.map(k=>Number(k[1])),
-        high: klines.map(k=>Number(k[2])),
-        low: klines.map(k=>Number(k[3])),
-        close: klines.map(k=>Number(k[4])),
-    };
-    if (BullishEngulfing.hasPattern(input)) return "Bullish Engulfing";
-    if (BearishEngulfing.hasPattern(input)) return "Bearish Engulfing";
-    if (Hammer.hasPattern(input)) return "Hammer";
-    if (ShootingStar.hasPattern(input)) return "Shooting Star";
-    const bb = BollingerBands.calculate({period: 20, stdDev: 2, values: input.close});
-    if (bb.length > 0) {
-        const last = bb[bb.length-1];
-        if ((last.upper - last.lower) / (last.middle || 1) < 0.015) return "Bollinger Squeeze";
-    }
-    return null;
+function normDirection(d) {
+  const x = String(d || '').toUpperCase();
+  return x === 'SHORT' ? 'SHORT' : 'LONG';
 }
 
-// --- DEEPSEEK ---
-async function deepseekForecast5(symbol, klines, patternName) {
+// --- STAGE 1: SELECTION (Find the Winner) ---
+async function deepseekSelectWinner(candidates) {
   if (!SILICON_KEY) return null;
   
-  // Calculate RSI
-  const closes = klines.map(k => Number(k[4]));
-  const rsi = calculateRSI(closes, 14);
-  
-  // Calculate Volume Spike
-  const volumes = klines.map(k => Number(k[5]));
-  const lastVol = volumes[volumes.length - 1];
-  const avgVol = volumes.slice(-21, -1).reduce((s, v) => s + v, 0) / 20;
-  const volSpike = avgVol ? (lastVol / avgVol * 100).toFixed(0) + '%' : 'N/A';
-  
-  const lastClose = closes[closes.length - 1];
-  const closesString = closes.join(',');
-  
-  const system = `You are Vortex AI, a legendary crypto sniper.
-Analyze the 1m chart data provided (Price, RSI, Volume Spike).
-Identify the probability of a move and provide:
-- SNIPER ENTRY: Current price.
-- TAKE PROFIT: Nearest liquidity level (reachable in 3-5 mins).
-- STOP LOSS: Tight invalidation level.
+  const system = `You are a Senior Quant Trader.
+Analyze 5 assets. Pick the SINGLE BEST opportunity for a 5-20 min scalp.
+Criteria: Market Structure, Volume Anomalies, RSI Divergence.
+OUTPUT: Just the Ticker Symbol of the winner.`;
 
-JSON OUTPUT: { "target_price": number, "stop_loss_price": number, "direction": "LONG"|"SHORT", "confidence": 0-100, "forecast_1m": [...] }`;
+  let userMsg = "Analyze these assets:\n";
+  candidates.forEach((c, i) => {
+      // ВОТ ТУТ МЫ ФОРМИРУЕМ ПОЛНУЮ СТРОКУ СВЕЧИ (OHLCV)
+      const candlesStr = c.klines.slice(-10).map(k => 
+          `[O:${k[1]} H:${k[2]} L:${k[3]} C:${k[4]} V:${k[5]}]`
+      ).join(' ');
+      
+      userMsg += `Asset ${i+1}: ${c.symbol}. RSI: ${c.rsi.toFixed(1)}. Candles (Last 10): ${candlesStr}\n\n`;
+  });
+  userMsg += "Which one is the winner? Return ONLY the symbol.";
 
-  const user = `Analyze ${symbol}. Price: ${lastClose}, RSI: ${rsi}, Volume: ${volSpike} spike.
-Previous 50 candles: ${closesString}.
-Provide Sniper Entry, TP, and SL.`;
-  
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), 25000); 
   try {
     const r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
-      method: 'POST', headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'Pro/deepseek-ai/DeepSeek-R1', messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0.1, response_format: { type: 'json_object' } }),
-      signal: controller.signal
+        method: 'POST', headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-ai/DeepSeek-V3', messages: [{ role: 'system', content: system }, { role: 'user', content: userMsg }], temperature: 0.1 }),
     });
-    clearTimeout(id);
+    if (!r.ok) return null;
+    const j = await r.json();
+    const content = j?.choices?.[0]?.message?.content || '';
+    const winner = candidates.find(c => content.includes(c.symbol));
+    return winner || null;
+  } catch (e) { return null; }
+}
+
+// --- STAGE 2: EXECUTION (Sniper Levels) ---
+async function deepseekExecution(winner) {
+  if (!SILICON_KEY) return null;
+
+  const klines = await fetchMexcKlines(winner.symbol, '1m', 30);
+  const depth = await fetchMexcDepth(winner.symbol, 20);
+  
+  // ВОТ ТУТ МЫ ОТПРАВЛЯЕМ ПОЛНУЮ ИСТОРИЮ (20 СВЕЧЕЙ OHLCV)
+  const candlesStr = klines.slice(-20).map(k => 
+      `[T:${new Date(k[0]).toTimeString().slice(0,5)} O:${k[1]} H:${k[2]} L:${k[3]} C:${k[4]} V:${k[5]}]`
+  ).join('\n');
+
+  const system = `You are an Elite Scalping Bot.
+Provide a high-precision entry for ${winner.symbol}.
+Strategy: Pump Exhaustion or Breakout. Timeframe: 5-20 mins.
+REQUIRED JSON OUTPUT:
+{
+  "direction": "LONG" | "SHORT",
+  "target_price": <number>,
+  "stop_loss_price": <number>,
+  "confidence": <number 0-100>,
+  "reasoning": "brief logic",
+  "forecast_1m": [ { "close": number }, ... 5 candles ... ]
+}`;
+
+  const user = `Final Analysis for ${winner.symbol}.
+Current Price: ${winner.price}. RSI: ${winner.rsi.toFixed(1)}.
+OrderBook Bids: ${depth?.bids?.[0]?.[0] || 'N/A'}. Asks: ${depth?.asks?.[0]?.[0] || 'N/A'}.
+
+Last 20 Candles (OHLCV):
+${candlesStr}
+
+Predict NOW.`;
+
+  try {
+    const r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
+        method: 'POST', headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-ai/DeepSeek-V3', messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0.1, response_format: { type: 'json_object' } }),
+    });
     if (!r.ok) return null;
     const j = await r.json();
     let content = j?.choices?.[0]?.message?.content || '{}';
     if (content.includes('```json')) content = content.split('```json')[1].split('```')[0].trim();
     const parsed = JSON.parse(content);
     if (!parsed.target_price) return null;
+
+    const now = Date.now();
     return {
-        candles: parsed.forecast_1m.map((c, i) => ({ t: Date.now() + (i+1)*60000, close: Number(c.close) })),
-        target_price: Number(parsed.target_price),
-        stop_loss_price: Number(parsed.stop_loss_price),
-        direction: parsed.direction,
-        confidence: Number(parsed.confidence),
+        ...parsed,
+        candles: parsed.forecast_1m.map((c, i) => ({ t: now + (i+1)*60000, close: Number(c.close) })),
         source: 'deepseek'
     };
   } catch (e) { return null; }
-}
-
-// --- ADAPTIVE PICKER ---
-async function pickAiWithAdaptiveGates(aiPool) {
-  const adaptiveSteps = [{ gates: { maxSpreadPct: 0.60, minDepth: 5_000, stddevMax: 0.35, backtestMean: 0.50 } }];
-  const accepted = [];
-  const pool = aiPool.slice().sort((a,b) => b.quoteVolume - a.quoteVolume).slice(0, 15); // Check top 15
-  const blacklist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'USDCUSDT', 'FDUSDUSDT'];
-
-  for (const step of adaptiveSteps) {
-    const candidatesToCheck = [];
-    for (const t of pool) {
-        if (blacklist.includes(t.symbol)) continue; 
-        if (t.quoteVolume < MIN_QUOTEVOL_AI) continue;
-        candidatesToCheck.push(t);
-    }
-    // Take TOP 5 valid candidates for parallel check
-    const results = await Promise.all(candidatesToCheck.slice(0, 5).map(async (candidate) => {
-        try {
-            // 1. Depth & Spread
-            const depth = await fetchMexcDepth(candidate.symbol, 20);
-            if (!depth || !depth.bids.length) return null;
-            const bestBid = Number(depth.bids[0][0]);
-            const bestAsk = Number(depth.asks[0][0]);
-            const mid = (bestBid+bestAsk)/2;
-            const spreadPct = ((bestAsk-bestBid)/mid)*100;
-            
-            // Calculate Depth in USDT
-            let bidUSDT = 0, askUSDT = 0;
-            depth.bids.forEach(b => bidUSDT += Number(b[0])*Number(b[1]));
-            depth.asks.forEach(a => askUSDT += Number(a[0])*Number(a[1]));
-            const depthUSDT = Math.min(bidUSDT, askUSDT);
-
-            // 2. Klines
-            const kl = await fetchMexcKlines(candidate.symbol, '1m', 35);
-            if (kl.length < 35) return null;
-            const closes = kl.map(k=>Number(k[4]));
-            const stdDev = relStdDevPct(closes);
-
-            // 3. AI Forecast
-            const pattern = detectPattern(kl);
-            const ds = await deepseekForecast5(candidate.symbol, kl, pattern);
-            
-            if (!ds || ds.confidence < 60) return null;
-
-            // Return FULL object with all stats
-            return { 
-                ...candidate, 
-                ...ds, 
-                spreadPct, 
-                depthUSDT,
-                stdDev 
-            };
-        } catch (e) { return null; }
-    }));
-
-    results.filter(r => r).forEach(v => accepted.push(v));
-    if (accepted.length >= 1) break; 
-  }
-  return accepted.slice(0, 2);
 }
 
 // --- DB & USER ---
@@ -274,16 +225,16 @@ let notifyProUsers = async (message) => { console.log('[notifyProUsers] noop', m
 
 const TEXTS = {
     ru: {
-        welcome: "👋 Добро пожаловать в Vortex AI!",
+        welcome: "👋 Добро пожаловать в Vortex AI!\n\nПожалуйста, подпишитесь на наш канал, чтобы продолжить.",
         sub_check: "🔄 Проверить подписку",
-        sub_error: "❌ Вы не подписаны на канал.",
+        sub_error: "❌ Вы не подписаны на канал. Подпишитесь, чтобы пользоваться ботом.",
         lang_select: "🌐 Выберите язык / Select Language:",
         menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Рынок", settings: "⚙️ Настройки", help: "❓ Помощь" },
         market: "🔄 Сканирую рынок...",
         premium_status: "✅ Ваш статус: PRO",
         premium_buy: "💎 **VORTEX PRO**\n\n• AI Снайпер Сигналы\n• Без задержек\n• Полный доступ\n\n**Цена:** 1000 RUB / 1 Месяц",
         pay_methods: { crypto: "💠 Крипта (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Карта РФ" },
-        disclaimer: "⚠️ **ЮРИДИЧЕСКИЙ ДИСКЛЕЙМЕР**\n\nТорговля — риск. Возврата нет.",
+        disclaimer: "⚠️ **ЮРИДИЧЕСКИЙ ДИСКЛЕЙМЕР**\n\n1. **Риски:** Торговля криптовалютой сопряжена с высоким риском. Вы можете потерять вложения.\n2. **Гарантии:** Сигналы Vortex AI — это прогнозы, а не финансовые советы. Мы не гарантируем прибыль.\n3. **Возврат:** Средства за подписку не возвращаются.\n\nНажимая кнопку оплаты, вы соглашаетесь с этими условиями.",
         agree_pay: "✅ Согласен, Оплатить",
         manual_pay: "💳 **Способ оплаты: Перевод на карту** 🇷🇺\n💰 **К оплате:** 1000 RUB\n\n👋 Напиши менеджеру по кнопке ниже, он выдаст реквизиты.\n\n🍇 **ПОСЛЕ ПЕРЕВОДА** — возвращайся сюда и жми кнопку **\"✅ Я Оплатил\"**. Затем отправляй скриншот.\n\n_Доступ выдаётся в течение 5 минут._",
         btn_manager: "📩 Написать Менеджеру",
@@ -296,11 +247,11 @@ const TEXTS = {
         no_sub: "❌ Нет подписки",
         days_left: "дней",
         buy_btn: "💎 Купить Premium",
-        help: "📚 **ПОМОЩЬ**\n\n• **AI Signals:** Снайперские входы от DeepSeek.\n• **FT:** Зоны перекупленности.\n\nSupport: @meanfive1",
+        help: "📚 **ПОМОЩЬ**\n\n• **AI Signals:** Снайперские входы от DeepSeek.\n• **FT:** Зоны перекупленности/перепроданности.\n\nSupport: @meanfive1",
         app_desc: "📱 **Vortex Web App**\n\nНажмите кнопку ниже, чтобы запустить:"
     },
     en: {
-        welcome: "👋 Welcome to Vortex AI!",
+        welcome: "👋 Welcome to Vortex AI!\n\nPlease subscribe to our channel to continue.",
         sub_check: "🔄 Check Subscription",
         sub_error: "❌ You are not subscribed.",
         lang_select: "🌐 Select Language:",
@@ -312,7 +263,7 @@ const TEXTS = {
         pay_methods: { crypto: "💠 Crypto (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Bank Card" },
         disclaimer: "⚠️ **LEGAL DISCLAIMER**\n\nTrading involves risk. No refunds.",
         agree_pay: "✅ I Agree & Pay",
-        manual_pay: "💳 **Payment Method: Bank Card**\n💰 **Price:** $10\n\n👋 Contact manager below.\n\n🍇 **AFTER PAYMENT** — come back and click **\"✅ I Paid\"**. Then send a screenshot.\n\n_Access granted within 5 mins._",
+        manual_pay: "💳 **Payment Method: Bank Card**\n💰 **Price:** $10\n\n👋 Contact manager below.\n\n🍇 **AFTER PAYMENT** — come back and click **\"✅ I Paid\"**. Then send a screenshot.\n\n<i>Access granted within 5 mins.</i>",
         btn_manager: "📩 Contact Manager",
         btn_paid: "✅ I Paid",
         btn_back: "🔙 Back",
@@ -530,6 +481,26 @@ if (TG_BOT_TOKEN) {
             if (id) { await User.findOneAndUpdate({ tgId: String(id) }, { isPremium: false }); ctx.reply(`❌ Removed from ${id}`); }
         });
 
+        bot.command('force', async (ctx) => {
+            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
+            const sym = (ctx.message.text.split(' ')[1] || 'DOGEUSDT').toUpperCase();
+            
+            const k = await fetchMexcKlines(sym, '1m', 50);
+            if (!k.length) return ctx.reply('Symbol not found');
+            const price = Number(k[k.length-1][4]);
+            
+            // Mock Signal
+            const signal = {
+                symbol: sym, tag: 'AI', price,
+                target_price: price * 1.002, stop_loss_price: price * 0.998, direction: 'LONG',
+                forecastCandles: [], detectedAt: Date.now(), status: 'ACTIVE', addedAt: Date.now(),
+                stdDev: 0, quoteVolume: 1000000, spreadPct: 0.01, source: 'deepseek'
+            };
+            
+            activeSignals.set(sym, signal);
+            ctx.reply(`✅ Forced ${sym}`);
+        });
+
         bot.launch().then(() => console.log('🤖 Bot Started'));
         
         process.once('SIGINT', () => bot.stop('SIGINT'));
@@ -555,7 +526,7 @@ function loadPersistedSignals() {
 async function runScannerJob() {
   if (scanInFlight) return;
   scanInFlight = true;
-  console.log('\n🔍 Running Elite Scanner Job...');
+  console.log('\n🔍 Running 2-Stage Elite Scanner...');
 
   try {
     const all = await fetch24hrTickers();
@@ -584,18 +555,44 @@ async function runScannerJob() {
     }
     symbolsToRemove.forEach(sym => activeSignals.delete(sym));
 
+    // STAGE 1: SELECTION
     if (activeSignals.size < 5) {
-        const aiPool = base.filter(x => x.quoteVolume > MIN_QUOTEVOL_AI);
-        const newPicks = await pickAiWithAdaptiveGates(aiPool);
-        newPicks.forEach(p => {
-            if (!activeSignals.has(p.symbol)) {
-                activeSignals.set(p.symbol, { ...p, tag: 'AI', detectedAt: Date.now(), status: 'ACTIVE', addedAt: Date.now() });
-                notifyProUsers(`🚨 NEW SIGNAL: ${p.symbol} ${p.direction}!\nTarget: ${p.target_price}`);
+        const candidates = base
+            .filter(x => x.symbol.endsWith('USDT') && !['USDCUSDT','FDUSDUSDT'].includes(x.symbol) && Number(x.quoteVolume) > 1000000)
+            .sort((a,b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent)) // Most Volatile
+            .slice(0, 5);
+
+        const enriched = [];
+        for (const c of candidates) {
+            const kl = await fetchMexcKlines(c.symbol, '1m', 15);
+            if (kl.length < 15) continue;
+            const closes = kl.map(k=>Number(k[4]));
+            enriched.push({ symbol: c.symbol, price: Number(c.lastPrice), quoteVolume: Number(c.quoteVolume), rsi: calculateRSI(closes), klines: kl });
+        }
+
+        if (enriched.length > 0) {
+            console.log('🤖 Selecting from:', enriched.map(e=>e.symbol));
+            const winner = await deepseekSelectWinner(enriched);
+            
+            if (winner) {
+                console.log('🏆 Winner:', winner.symbol);
+                const signal = await deepseekExecution(winner);
+                if (signal) {
+                    activeSignals.set(winner.symbol, {
+                        symbol: winner.symbol, tag: 'AI', price: winner.price,
+                        target_price: signal.target_price, stop_loss_price: signal.stop_loss_price, direction: signal.direction,
+                        forecastCandles: signal.candles, detectedAt: Date.now(), status: 'ACTIVE',
+                        addedAt: Date.now(), stdDev: 0, quoteVolume: winner.quoteVolume, change24hPct: 0
+                    });
+                    notifyProUsers(`🚨 NEW SIGNAL: ${winner.symbol} ${signal.direction}!\nTarget: ${signal.target_price}`);
+                }
             }
-        });
+        }
     }
 
+    // FT Signals
     const ftPicks = [];
+    // ... (Keep FT logic as simple placeholder or implement full)
     const ftCandidates = base.filter(x => x.quoteVolume >= MIN_QUOTEVOL_FT && x.lastPrice >= MIN_PRICE_FT && !activeSignals.has(x.symbol))
         .sort((a,b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent)).slice(0, 60);
 
