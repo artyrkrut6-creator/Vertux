@@ -133,28 +133,41 @@ function detectPattern(klines) {
 }
 
 // --- DEEPSEEK ---
-async function deepseekForecast5(symbol, contextCandles, patternName) {
+async function deepseekForecast5(symbol, klines, patternName) {
   if (!SILICON_KEY) return null;
-  const system = `You are Vortex AI, an elite crypto scalper.
-Goal: Predict exact 5-min price movement based on Price Action.
-Pattern Detected: ${patternName || 'Momentum'}.
+  
+  // Calculate RSI
+  const closes = klines.map(k => Number(k[4]));
+  const rsi = calculateRSI(closes, 14);
+  
+  // Calculate Volume Spike
+  const volumes = klines.map(k => Number(k[5]));
+  const lastVol = volumes[volumes.length - 1];
+  const avgVol = volumes.slice(-21, -1).reduce((s, v) => s + v, 0) / 20;
+  const volSpike = avgVol ? (lastVol / avgVol * 100).toFixed(0) + '%' : 'N/A';
+  
+  const lastClose = closes[closes.length - 1];
+  const closesString = closes.join(',');
+  
+  const system = `You are Vortex AI, a legendary crypto sniper.
+Analyze the 1m chart data provided (Price, RSI, Volume Spike).
+Identify the probability of a move and provide:
+- SNIPER ENTRY: Current price.
+- TAKE PROFIT: Nearest liquidity level (reachable in 3-5 mins).
+- STOP LOSS: Tight invalidation level.
 
-RULES:
-1. TARGET: Must be a nearby Support/Resistance level (0.5% - 2% range).
-2. STOP LOSS: Tight invalidation level.
-3. DIRECTION: Follow the trend of the last 10 candles.
+JSON OUTPUT: { "target_price": number, "stop_loss_price": number, "direction": "LONG"|"SHORT", "confidence": 0-100, "forecast_1m": [...] }`;
 
-REQUIRED JSON:
-{ "target_price": number, "stop_loss_price": number, "direction": "LONG"|"SHORT", "confidence": 0-100, "forecast_1m": [ ... ] }`;
-
-  const user = `Symbol: ${symbol}. Last close: ${contextCandles[contextCandles.length-1].close}. Recent closes: ${contextCandles.map(c=>c.close).join(',')}`;
+  const user = `Analyze ${symbol}. Price: ${lastClose}, RSI: ${rsi}, Volume: ${volSpike} spike.
+Previous 50 candles: ${closesString}.
+Provide Sniper Entry, TP, and SL.`;
   
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), 25000); 
   try {
     const r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
       method: 'POST', headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'deepseek-ai/DeepSeek-V3', messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0.1, response_format: { type: 'json_object' } }),
+      body: JSON.stringify({ model: 'Pro/deepseek-ai/DeepSeek-R1', messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0.1, response_format: { type: 'json_object' } }),
       signal: controller.signal
     });
     clearTimeout(id);
@@ -214,7 +227,7 @@ async function pickAiWithAdaptiveGates(aiPool) {
 
             // 3. AI Forecast
             const pattern = detectPattern(kl);
-            const ds = await deepseekForecast5(candidate.symbol, kl.map(k=>({close:Number(k[4])})), pattern);
+            const ds = await deepseekForecast5(candidate.symbol, kl, pattern);
             
             if (!ds || ds.confidence < 60) return null;
 
