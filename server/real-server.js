@@ -26,12 +26,15 @@ const MIN_PRICE_FT = 0.02;
 const MIN_PRICE_AI = 0.10;
 const MIN_QUOTEVOL_FT = 700_000;
 const MIN_QUOTEVOL_AI = 1_500_000;
-const FT_INTERVAL = 60_000;
-const AI_INTERVAL = 600_000;
+const MAX_SPREAD_FT_PCT = 0.50;
+const MAX_SPREAD_AI_PCT = 0.60;
+const MIN_DEPTH_FT_USDT = 10_000;
+const MIN_DEPTH_AI_USDT = 5_000;
 const BACKTEST_KLINES = 40;
-const CHUNK_SIZE = 20; // <--- ВОТ ЭТО БЫЛО ПОТЕРЯНО
+const CHUNK_SIZE = 20; 
+const FT_INTERVAL = 60_000; // 1 min
+const AI_INTERVAL = 600_000; // 10 mins
 const SILICON_KEY = process.env.SILICON_KEY || null;
-// ... остальные константы ...
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || null;
 const WEBAPP_URL = process.env.WEBAPP_URL || 'https://vortex-ai-nffc.onrender.com';
 const MONGO_URI = process.env.MONGO_URI || null;
@@ -47,6 +50,7 @@ const activeSignals = new Map();
 let lastFtPicks = [];
 const sseClients = new Set();
 const pendingVerifications = new Map();
+const lastDemoteReasonCounts = { lowPriceVol:0, spreadDepth:0, stddev:0, backtestError:0, backtestThreshold:0, directionalFail:0, insufficientKlines:0, sawtooth:0 };
 
 // --- HELPERS ---
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -138,7 +142,7 @@ async function deepseekForecast5(symbol, contextCandles, patternName) {
   const user = `Symbol: ${symbol}. Last close: ${contextCandles[contextCandles.length-1].close}. Predict now.`;
   
   const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), 25000); 
+  const id = setTimeout(() => controller.abort(), 20000); 
   try {
     const r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
       method: 'POST', headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
@@ -163,11 +167,13 @@ async function deepseekForecast5(symbol, contextCandles, patternName) {
   } catch (e) { return null; }
 }
 
+// --- ADAPTIVE PICKER (RELAXED) ---
 async function pickAiWithAdaptiveGates(aiPool) {
   const adaptiveSteps = [{ gates: { maxSpreadPct: 0.60, minDepth: 5_000, stddevMax: 0.35, backtestMean: 0.50 } }];
   const accepted = [];
   const pool = aiPool.slice().sort((a,b) => b.quoteVolume - a.quoteVolume).slice(0, 10);
   const blacklist = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'USDCUSDT', 'FDUSDUSDT'];
+
   for (const step of adaptiveSteps) {
     const candidatesToCheck = [];
     for (const t of pool) {
@@ -180,7 +186,7 @@ async function pickAiWithAdaptiveGates(aiPool) {
             const kl = await fetchMexcKlines(candidate.symbol, '1m', 35);
             if (kl.length < 35) return null;
             const pattern = detectPattern(kl);
-            const ds = await deepseekForecast5(candidate.symbol, kl.map(k=>({close:Number(k[4])})), pattern);
+            const ds = await deepseekForecast5(candidate.symbol, kl.map(k=>({close:Number(k[4])})));
             if (!ds || ds.confidence < 60) return null;
             return { ...candidate, ...ds };
         } catch (e) { return null; }
@@ -219,14 +225,14 @@ const TEXTS = {
     ru: {
         welcome: "👋 Добро пожаловать в Vortex AI!\n\nПожалуйста, подпишитесь на наш канал, чтобы продолжить.",
         sub_check: "🔄 Проверить подписку",
-        sub_error: "❌ Вы не подписаны на канал.",
+        sub_error: "❌ Вы не подписаны на канал. Подпишитесь, чтобы пользоваться ботом.",
         lang_select: "🌐 Выберите язык / Select Language:",
         menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Рынок", settings: "⚙️ Настройки", help: "❓ Помощь" },
         market: "🔄 Сканирую рынок...",
         premium_status: "✅ Ваш статус: PRO",
         premium_buy: "💎 **VORTEX PRO**\n\n• AI Снайпер Сигналы\n• Без задержек\n• Полный доступ\n\n**Цена:** 1000 RUB / 1 Месяц",
         pay_methods: { crypto: "💠 Крипта (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Карта РФ" },
-        disclaimer: "⚠️ **ЮРИДИЧЕСКИЙ ДИСКЛЕЙМЕР**\n\nТорговля — риск. Возврата нет.",
+        disclaimer: "⚠️ **ЮРИДИЧЕСКИЙ ДИСКЛЕЙМЕР**\n\n1. **Риски:** Торговля криптовалютой сопряжена с высоким риском. Вы можете потерять вложения.\n2. **Гарантии:** Сигналы Vortex AI — это прогнозы, а не финансовые советы. Мы не гарантируем прибыль.\n3. **Возврат:** Средства за подписку не возвращаются.\n\nНажимая кнопку оплаты, вы соглашаетесь с этими условиями.",
         agree_pay: "✅ Согласен, Оплатить",
         manual_pay: "💳 **Способ оплаты: Перевод на карту** 🇷🇺\n💰 **К оплате:** 1000 RUB\n\n👋 Напиши менеджеру по кнопке ниже, он выдаст реквизиты.\n\n🍇 **ПОСЛЕ ПЕРЕВОДА** — возвращайся сюда и жми кнопку **\"✅ Я Оплатил\"**. Затем отправляй скриншот.\n\n_Доступ выдаётся в течение 5 минут._",
         btn_manager: "📩 Написать Менеджеру",
@@ -239,11 +245,11 @@ const TEXTS = {
         no_sub: "❌ Нет подписки",
         days_left: "дней",
         buy_btn: "💎 Купить Premium",
-        help: "📚 **ПОМОЩЬ**\n\n• **AI Signals:** Снайперские входы от DeepSeek.\n• **FT:** Зоны перекупленности.\n\nSupport: @meanfive1",
+        help: "📚 **ПОМОЩЬ**\n\n• **AI Signals:** Снайперские входы от DeepSeek.\n• **FT:** Зоны перекупленности/перепроданности.\n\nSupport: @meanfive1",
         app_desc: "📱 **Vortex Web App**\n\nНажмите кнопку ниже, чтобы запустить:"
     },
     en: {
-        welcome: "👋 Welcome to Vortex AI!",
+        welcome: "👋 Welcome to Vortex AI!\n\nPlease subscribe to our channel to continue.",
         sub_check: "🔄 Check Subscription",
         sub_error: "❌ You are not subscribed.",
         lang_select: "🌐 Select Language:",
@@ -270,11 +276,12 @@ const TEXTS = {
     }
 };
 
-// --- TELEGRAM BOT ---
+// --- TELEGRAM BOT (FIXED KEYBOARD) ---
 if (TG_BOT_TOKEN) {
     try {
         const bot = new Telegraf(TG_BOT_TOKEN);
 
+        // SAFE KEYBOARD GENERATOR
         const getMenu = (lang) => {
             const T = TEXTS[lang] || TEXTS['ru'];
             return Markup.keyboard([
@@ -328,24 +335,54 @@ if (TG_BOT_TOKEN) {
             ]));
         });
 
-        // ADMIN
+        // --- ADMIN COMMANDS ---
         bot.command('admin', async (ctx) => {
-            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
+            if (String(ctx.from.id) !== String(ADMIN_ID)) return; 
             const count = await User.countDocuments();
             const pros = await User.countDocuments({ isPremium: true });
-            ctx.reply(`👑 **ADMIN**\nTotal: ${count}\nPRO: ${pros}\n\n/give <id>\n/del <id>`);
+            ctx.reply(`👑 **ADMIN PANEL**\n\n👥 Users: ${count}\n💎 PRO: ${pros}\n\nCommands:\n/give <id>\n/del <id>`);
         });
 
         bot.command('give', async (ctx) => {
             if (String(ctx.from.id) !== String(ADMIN_ID)) return;
             const id = ctx.message.text.split(' ')[1];
-            if (id) { await activateUser(id); ctx.reply(`✅ Given to ${id}`); }
+            if (id) { 
+                await activateUser(id); 
+                ctx.reply(`✅ Given PRO to ${id}`);
+                try { await bot.telegram.sendMessage(id, '🎉 **Admin granted you Premium!** Restart app.'); } catch(e){}
+            } else {
+                ctx.reply('Usage: /give 12345678');
+            }
         });
 
         bot.command('del', async (ctx) => {
             if (String(ctx.from.id) !== String(ADMIN_ID)) return;
             const id = ctx.message.text.split(' ')[1];
-            if (id) { await User.findOneAndUpdate({ tgId: String(id) }, { isPremium: false }); ctx.reply(`❌ Removed from ${id}`); }
+            if (id) { 
+                await User.findOneAndUpdate({ tgId: String(id) }, { isPremium: false });
+                ctx.reply(`❌ Removed PRO from ${id}`); 
+            }
+        });
+
+        // --- FORCE AI COMMAND (DEBUG) ---
+        bot.command('force', async (ctx) => {
+            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
+            const sym = (ctx.message.text.split(' ')[1] || 'DOGEUSDT').toUpperCase();
+            
+            const k = await fetchMexcKlines(sym, '1m', 50);
+            if (!k.length) return ctx.reply('Symbol not found');
+            const price = Number(k[k.length-1][4]);
+            
+            // Mock Signal
+            const signal = {
+                symbol: sym, tag: 'AI', price,
+                target_price: price * 1.002, stop_loss_price: price * 0.998, direction: 'LONG',
+                forecastCandles: [], detectedAt: Date.now(), status: 'ACTIVE', addedAt: Date.now(),
+                stdDev: 0, quoteVolume: 1000000, spreadPct: 0.01, source: 'deepseek'
+            };
+            
+            activeSignals.set(sym, signal);
+            ctx.reply(`✅ Forced ${sym}`);
         });
 
         bot.action(/^lang_(.+)$/, async (ctx) => {
@@ -470,7 +507,7 @@ if (TG_BOT_TOKEN) {
 
         bot.hears(/❓ Help|❓ Помощь/, async (ctx) => {
             const T = await getT(ctx);
-            ctx.reply(T.help, { parse_mode: 'Markdown' });
+            ctx.reply(T.help, { parse_mode: 'HTML' });
         });
 
         bot.launch().then(() => console.log('🤖 Bot Started'));
@@ -481,7 +518,15 @@ if (TG_BOT_TOKEN) {
     } catch(e) { console.error('Bot Error:', e); }
 }
 
-// --- SCANNER JOB (DUAL) ---
+// --- SCANNER JOB (DUAL CYCLE) ---
+function saveState() {
+    const finalDetected = [...Array.from(activeSignals.values()), ...lastFtPicks];
+    const forecasts = {};
+    activeSignals.forEach(s => { forecasts[s.symbol] = { generatedAt: s.addedAt, horizonMinutes: 5, candles: s.forecastCandles, target_price: s.target_price, stop_loss_price: s.stop_loss_price, direction: s.direction, status: s.status, source: 'deepseek' }; });
+    const payload = { ts: new Date().toISOString(), nextScanAt: nextFtScan, nextAiScan: nextAiScan, parsed: { detected: finalDetected, forecastsBySymbol: forecasts } };
+    try { fs.writeFileSync(DATA_FILE, JSON.stringify(payload)); sseBroadcast('scheduled_update', payload); } catch(e){}
+}
+
 async function runScannerJob() {
   if (scanInFlight) return;
   scanInFlight = true;
@@ -491,12 +536,45 @@ async function runScannerJob() {
     const all = await fetch24hrTickers();
     if (!all) throw new Error("MEXC API Fail");
     
+    const base = all.map(x => ({ symbol: x.symbol, quoteVolume: Number(x.quoteVolume), lastPrice: Number(x.lastPrice), priceChangePercent: Number(x.priceChangePercent) }))
+        .filter(x => x.symbol.endsWith('USDT') && isSaneUsdtSymbol(x.symbol) && !isStablecoinLike(x.symbol) && !isLeveraged(x.symbol));
+
+    const baseMap = new Map(base.map(b => [b.symbol, b]));
+    
+    // UPDATE ACTIVE SIGNALS (CRITICAL FIX: CHECK PRICE EVERY CYCLE)
+    const toRemove = [];
+    for (const [sym, sig] of Array.from(activeSignals.entries())) {
+        const tick = baseMap.get(sym);
+        if (!tick) continue;
+        const price = Number(tick.lastPrice);
+        
+        // AUTO-REMOVE LOGIC (IMMEDIATE)
+        let done = false;
+        if (sig.status === 'ACTIVE') {
+            if (sig.direction === 'LONG') {
+                if (price >= sig.target_price) { sig.status = 'WON'; done = true; }
+                else if (price <= sig.stop_loss_price) { sig.status = 'LOST'; done = true; }
+            } else {
+                if (price <= sig.target_price) { sig.status = 'WON'; done = true; }
+                else if (price >= sig.stop_loss_price) { sig.status = 'LOST'; done = true; }
+            }
+            sig.price = price;
+        }
+        
+        if (done) {
+            // Signal resolved -> Mark for deletion (Frontend will animate then remove)
+            sig.removeAt = Date.now(); 
+            toRemove.push(sym);
+        }
+    }
+    // Delete resolved signals from map (so they disappear from list next update)
+    toRemove.forEach(sym => activeSignals.delete(sym));
+
     // 1. FT SCAN (Every 1 min)
     if (now >= nextFtScan) {
         console.log('⚡ Running FT Scan...');
-        nextFtScan = now + 60000;
-        const base = all.filter(x => x.symbol.endsWith('USDT') && Number(x.quoteVolume) > MIN_QUOTEVOL_FT).map(x => ({ ...x, lastPrice: Number(x.lastPrice), quoteVolume: Number(x.quoteVolume), priceChangePercent: Number(x.priceChangePercent) }));
-        const ftPool = base.filter(x => !activeSignals.has(x.symbol)).sort((a,b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent)).slice(0, 60);
+        nextFtScan = now + FT_INTERVAL;
+        const ftPool = base.filter(x => !activeSignals.has(x.symbol) && x.quoteVolume >= MIN_QUOTEVOL_FT).sort((a,b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent)).slice(0, 60);
         const ftPicks = [];
         for (let i=0; i<ftPool.length; i+=CHUNK_SIZE) {
             const chunk = ftPool.slice(i, i+CHUNK_SIZE);
@@ -508,20 +586,20 @@ async function runScannerJob() {
                 ftPicks.push({ ...t, rsi, signal, tag: 'FT', stdDev: relStdDevPct(k.map(x=>Number(x[4]))) });
             }));
         }
-        lastFtPicks = ftPicks.slice(0, 20); 
+        // Balance FT
+        const longs = ftPicks.filter(f => f.signal === 'LONG').slice(0,7);
+        const shorts = ftPicks.filter(f => f.signal === 'SHORT').slice(0,7);
+        const vols = ftPicks.filter(f => f.signal === 'NEUTRAL').slice(0,6);
+        lastFtPicks = [...longs, ...shorts, ...vols];
     }
 
     // 2. AI SCAN (Every 10 mins)
     if (now >= nextAiScan) {
         console.log('🧠 Running AI Scan...');
-        nextAiScan = now + 600000;
+        nextAiScan = now + AI_INTERVAL;
         
-        for (const [sym, sig] of activeSignals) {
-            if (sig.removeAt && now > sig.removeAt) activeSignals.delete(sym);
-        }
-
         if (activeSignals.size < 5) {
-            const aiPool = all.filter(x => x.symbol.endsWith('USDT') && Number(x.quoteVolume) > MIN_QUOTEVOL_AI).map(x => ({ ...x, lastPrice: Number(x.lastPrice), quoteVolume: Number(x.quoteVolume) }));
+            const aiPool = base.filter(x => x.quoteVolume > MIN_QUOTEVOL_AI);
             const newPicks = await pickAiWithAdaptiveGates(aiPool);
             newPicks.forEach(p => {
                 if (!activeSignals.has(p.symbol)) {
@@ -532,12 +610,7 @@ async function runScannerJob() {
         }
     }
 
-    // Save
-    const finalDetected = [...Array.from(activeSignals.values()), ...lastFtPicks];
-    const forecasts = {};
-    activeSignals.forEach(s => { forecasts[s.symbol] = { generatedAt: s.addedAt, horizonMinutes: 5, candles: s.forecastCandles, target_price: s.target_price, stop_loss_price: s.stop_loss_price, direction: s.direction, status: s.status, source: 'deepseek' }; });
-    const payload = { ts: new Date().toISOString(), nextScanAt: nextFtScan, nextAiScan: nextAiScan, parsed: { detected: finalDetected, forecastsBySymbol: forecasts } };
-    try { fs.writeFileSync(DATA_FILE, JSON.stringify(payload)); sseBroadcast('scheduled_update', payload); } catch(e){}
+    saveState();
 
   } catch (e) { console.error(e); } 
   finally { scanInFlight = false; setTimeout(runScannerJob, 30000); }
@@ -547,7 +620,7 @@ async function runScannerJob() {
 app.use(express.static(path.join(__dirname, '../dist')));
 app.get('*', (req, res) => { if (!req.path.startsWith('/api')) res.sendFile(path.join(__dirname, '../dist/index.html')); });
 app.listen(PORT, () => { 
-    nextFtScan = Date.now(); nextAiScan = Date.now();
+    nextFtScan = Date.now(); nextAiScan = Date.now(); 
     try { loadPersistedSignals(); } catch(e){} 
     console.log(`🚀 Server on ${PORT}`); 
     runScannerJob(); 
