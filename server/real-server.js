@@ -42,6 +42,10 @@ let scanInFlight = false;
 const activeSignals = new Map();
 const sseClients = new Set();
 const pendingVerifications = new Map();
+const FT_INTERVAL = 60_000; // 1 min
+const AI_INTERVAL = 600_000; // 10 mins
+let nextFtScan = Date.now();
+let nextAiScan = Date.now();
 
 // --- HELPERS ---
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -222,6 +226,89 @@ async function checkUser(id) {
 }
 
 let notifyProUsers = async (message) => { console.log('[notifyProUsers] noop', message); };
+
+// --- SCANNER FUNCTIONS ---
+async function runFtScan() {
+  console.log('⚡ Running FT Scan...');
+  const all = await fetch24hrTickers();
+  if (!all) return [];
+
+  const base = all.map(x => ({ symbol: x.symbol, quoteVolume: Number(x.quoteVolume), lastPrice: Number(x.lastPrice), priceChangePercent: Number(x.priceChangePercent) }))
+      .filter(x => x.symbol.endsWith('USDT') && isSaneUsdtSymbol(x.symbol) && !isStablecoinLike(x.symbol) && !isLeveraged(x.symbol));
+
+  const ftPicks = [];
+  const ftCandidates = base.filter(x => x.quoteVolume >= MIN_QUOTEVOL_FT && x.lastPrice >= MIN_PRICE_FT && !activeSignals.has(x.symbol))
+      .sort((a,b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent)).slice(0, 60);
+
+  for (let i=0; i<ftCandidates.length; i+=CHUNK_SIZE) {
+      const chunk = ftCandidates.slice(i, i+CHUNK_SIZE);
+      await Promise.all(chunk.map(async (t) => {
+          const k = await fetchMexcKlines(t.symbol, '1m', 20);
+          if(k.length < 15) return;
+          const rsi = calculateRSI(k.map(x=>Number(x[4])), 14);
+          let signal = 'NEUTRAL'; if (rsi < 35) signal = 'LONG'; if (rsi > 65) signal = 'SHORT';
+          ftPicks.push({ ...t, rsi, signal, tag: 'FT', stdDev: relStdDevPct(k.map(x=>Number(x[4]))) });
+      }));
+  }
+
+  const longs = ftPicks.filter(f => f.signal === 'LONG').slice(0,7);
+  const shorts = ftPicks.filter(f => f.signal === 'SHORT').slice(0,7);
+  const vols = ftPicks.filter(f => f.signal === 'NEUTRAL').slice(0,6);
+  return [...longs, ...shorts, ...vols].map(ft => ({
+      symbol: ft.symbol, tag: 'FT', price: ft.lastPrice, stdDev: ft.stdDev, quoteVolume: ft.quoteVolume,
+      change24hPct: ft.priceChangePercent, detectedAt: Date.now(), expiresAt: Date.now()+600000, signal: ft.signal, rsi: ft.rsi
+  }));
+}
+
+async function runAiScan() {
+  console.log('🧠 Running AI Scan...');
+  const all = await fetch24hrTickers();
+  if (!all) return { aiSignals: [], forecasts: {} };
+
+  const base = all.map(x => ({ symbol: x.symbol, quoteVolume: Number(x.quoteVolume), lastPrice: Number(x.lastPrice), priceChangePercent: Number(x.priceChangePercent) }))
+      .filter(x => x.symbol.endsWith('USDT') && isSaneUsdtSymbol(x.symbol) && !isStablecoinLike(x.symbol) && !isLeveraged(x.symbol));
+
+  const baseMap = new Map(base.map(b => [b.symbol, b]));
+  const symbolsToRemove = [];
+
+  for (const [sym, sig] of Array.from(activeSignals.entries())) {
+      const tick = baseMap.get(sym);
+      if (!tick) continue;
+      const price = Number(tick.lastPrice);
+      
+      let done = false;
+      if (sig.direction === 'LONG') {
+          if (price >= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+60000; done = true; }
+          else if (price <= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+60000; done = true; }
+      } else {
+          if (price <= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+60000; done = true; }
+          else if (price >= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+60000; done = true; }
+      }
+      if (done) symbolsToRemove.push(sym); else sig.price = price;
+  }
+  symbolsToRemove.forEach(sym => activeSignals.delete(sym));
+
+  if (activeSignals.size < 5) {
+      const aiPool = base.filter(x => x.quoteVolume > MIN_QUOTEVOL_AI);
+      const newPicks = await pickAiWithAdaptiveGates(aiPool);
+      newPicks.forEach(p => {
+          if (!activeSignals.has(p.symbol)) {
+              activeSignals.set(p.symbol, { ...p, tag: 'AI', detectedAt: Date.now(), status: 'ACTIVE', addedAt: Date.now() });
+              notifyProUsers(`🚨 NEW SIGNAL: ${p.symbol} ${p.direction}!\nTarget: ${p.target_price}`);
+          }
+      });
+  }
+
+  const forecasts = {};
+  activeSignals.forEach(s => {
+      forecasts[s.symbol] = {
+          generatedAt: s.addedAt, horizonMinutes: 5, candles: s.forecastCandles,
+          target_price: s.target_price, stop_loss_price: s.stop_loss_price, direction: s.direction, status: s.status, source: 'deepseek'
+      };
+  });
+
+  return { aiSignals: Array.from(activeSignals.values()), forecasts };
+}
 
 const TEXTS = {
     ru: {
@@ -526,113 +613,35 @@ function loadPersistedSignals() {
 async function runScannerJob() {
   if (scanInFlight) return;
   scanInFlight = true;
-  console.log('\n🔍 Running 2-Stage Elite Scanner...');
+
+  const now = Date.now();
+  let didFt = false;
+  let didAi = false;
+  let ftSignals = [];
+  let aiData = { aiSignals: [], forecasts: {} };
 
   try {
-    const all = await fetch24hrTickers();
-    if (!all) throw new Error("MEXC API Fail");
-
-    const base = all.map(x => ({ symbol: x.symbol, quoteVolume: Number(x.quoteVolume), lastPrice: Number(x.lastPrice), priceChangePercent: Number(x.priceChangePercent) }))
-        .filter(x => x.symbol.endsWith('USDT') && isSaneUsdtSymbol(x.symbol) && !isStablecoinLike(x.symbol) && !isLeveraged(x.symbol));
-
-    const baseMap = new Map(base.map(b => [b.symbol, b]));
-    const symbolsToRemove = [];
-
-    for (const [sym, sig] of Array.from(activeSignals.entries())) {
-        const tick = baseMap.get(sym);
-        if (!tick) continue;
-        const price = Number(tick.lastPrice);
-        
-        let done = false;
-        if (sig.direction === 'LONG') {
-            if (price >= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+60000; done = true; }
-            else if (price <= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+60000; done = true; }
-        } else {
-            if (price <= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+60000; done = true; }
-            else if (price >= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+60000; done = true; }
-        }
-        if (done) symbolsToRemove.push(sym); else sig.price = price;
-    }
-    symbolsToRemove.forEach(sym => activeSignals.delete(sym));
-
-    // STAGE 1: SELECTION
-    if (activeSignals.size < 5) {
-        const candidates = base
-            .filter(x => x.symbol.endsWith('USDT') && !['USDCUSDT','FDUSDUSDT'].includes(x.symbol) && Number(x.quoteVolume) > 1000000)
-            .sort((a,b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent)) // Most Volatile
-            .slice(0, 5);
-
-        const enriched = [];
-        for (const c of candidates) {
-            const kl = await fetchMexcKlines(c.symbol, '1m', 15);
-            if (kl.length < 15) continue;
-            const closes = kl.map(k=>Number(k[4]));
-            enriched.push({ symbol: c.symbol, price: Number(c.lastPrice), quoteVolume: Number(c.quoteVolume), rsi: calculateRSI(closes), klines: kl });
-        }
-
-        if (enriched.length > 0) {
-            console.log('🤖 Selecting from:', enriched.map(e=>e.symbol));
-            const winner = await deepseekSelectWinner(enriched);
-            
-            if (winner) {
-                console.log('🏆 Winner:', winner.symbol);
-                const signal = await deepseekExecution(winner);
-                if (signal) {
-                    activeSignals.set(winner.symbol, {
-                        symbol: winner.symbol, tag: 'AI', price: winner.price,
-                        target_price: signal.target_price, stop_loss_price: signal.stop_loss_price, direction: signal.direction,
-                        forecastCandles: signal.candles, detectedAt: Date.now(), status: 'ACTIVE',
-                        addedAt: Date.now(), stdDev: 0, quoteVolume: winner.quoteVolume, change24hPct: 0
-                    });
-                    notifyProUsers(`🚨 NEW SIGNAL: ${winner.symbol} ${signal.direction}!\nTarget: ${signal.target_price}`);
-                }
-            }
-        }
+    if (now >= nextFtScan) {
+      ftSignals = await runFtScan();
+      nextFtScan = now + FT_INTERVAL;
+      didFt = true;
     }
 
-    // FT Signals
-    const ftPicks = [];
-    // ... (Keep FT logic as simple placeholder or implement full)
-    const ftCandidates = base.filter(x => x.quoteVolume >= MIN_QUOTEVOL_FT && x.lastPrice >= MIN_PRICE_FT && !activeSignals.has(x.symbol))
-        .sort((a,b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent)).slice(0, 60);
-
-    for (let i=0; i<ftCandidates.length; i+=CHUNK_SIZE) {
-        const chunk = ftCandidates.slice(i, i+CHUNK_SIZE);
-        await Promise.all(chunk.map(async (t) => {
-            const k = await fetchMexcKlines(t.symbol, '1m', 20);
-            if(k.length < 15) return;
-            const rsi = calculateRSI(k.map(x=>Number(x[4])), 14);
-            let signal = 'NEUTRAL'; if (rsi < 35) signal = 'LONG'; if (rsi > 65) signal = 'SHORT';
-            ftPicks.push({ ...t, rsi, signal, tag: 'FT', stdDev: relStdDevPct(k.map(x=>Number(x[4]))) });
-        }));
+    if (now >= nextAiScan) {
+      aiData = await runAiScan();
+      nextAiScan = now + AI_INTERVAL;
+      didAi = true;
     }
 
-    const finalDetected = [...Array.from(activeSignals.values())];
-    const forecasts = {};
-    activeSignals.forEach(s => {
-        forecasts[s.symbol] = {
-            generatedAt: s.addedAt, horizonMinutes: 5, candles: s.forecastCandles,
-            target_price: s.target_price, stop_loss_price: s.stop_loss_price, direction: s.direction, status: s.status, source: 'deepseek'
-        };
-    });
+    if (didFt || didAi) {
+      const finalDetected = [...aiData.aiSignals, ...ftSignals];
+      const payload = { ts: new Date().toISOString(), parsed: { nextFtScan, nextAiScan, detected: finalDetected, forecastsBySymbol: aiData.forecasts } };
+      fs.writeFileSync(DATA_FILE, JSON.stringify(payload));
+      sseBroadcast('scheduled_update', payload);
+      console.log(`✅ Updated: FT=${didFt}, AI=${didAi}`);
+    }
 
-    const longs = ftPicks.filter(f => f.signal === 'LONG').slice(0,7);
-    const shorts = ftPicks.filter(f => f.signal === 'SHORT').slice(0,7);
-    const vols = ftPicks.filter(f => f.signal === 'NEUTRAL').slice(0,6);
-    [...longs, ...shorts, ...vols].forEach(ft => finalDetected.push({
-        symbol: ft.symbol, tag: 'FT', price: ft.lastPrice, stdDev: ft.stdDev, quoteVolume: ft.quoteVolume,
-        change24hPct: ft.priceChangePercent, detectedAt: Date.now(), expiresAt: Date.now()+600000, signal: ft.signal, rsi: ft.rsi
-    }));
-
-    console.log(`✅ Final: AI=${activeSignals.size}, FT=${finalDetected.length - activeSignals.size}`);
-
-    const payload = { ts: new Date().toISOString(), nextScanAt: Date.now() + UI_INTERVAL, parsed: { detected: finalDetected, forecastsBySymbol: forecasts } };
-    fs.writeFileSync(DATA_FILE, JSON.stringify(payload));
-    sseBroadcast('scheduled_update', payload);
-
-    setTimeout(runScannerJob, Math.max(0, UI_INTERVAL - PRE_WORK_TIME));
-
-  } catch (e) { console.error(e); setTimeout(runScannerJob, 60000); } 
+  } catch (e) { console.error(e); } 
   finally { scanInFlight = false; }
 }
 
@@ -671,4 +680,4 @@ app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, '../dist/index.html'));
 });
 
-app.listen(PORT, () => { try { loadPersistedSignals(); } catch(e){} console.log(`🚀 Server on ${PORT}`); runScannerJob(); });
+app.listen(PORT, () => { try { loadPersistedSignals(); } catch(e){} console.log(`🚀 Server on ${PORT}`); setInterval(runScannerJob, 30000); });

@@ -8,48 +8,60 @@ interface Props {
 }
 
 const Card = ({ title, icon: Icon, children, color }: any) => (
-  <motion.div 
-    initial={{ opacity: 0, y: 20 }}
-    animate={{ opacity: 1, y: 0 }}
-    className={`flex-1 bg-white/5 border border-white/10 rounded-xl p-4 backdrop-blur-md relative overflow-hidden group`}
-  >
+  <div className={`flex-1 bg-white/5 border border-white/10 rounded-xl p-4 backdrop-blur-md relative overflow-hidden group`}>
     <div className={`absolute top-0 left-0 w-1 h-full ${color}`} />
     <div className="flex items-center gap-2 mb-3 text-gray-400 text-xs uppercase font-bold tracking-wider">
       <Icon size={14} /> {title}
     </div>
     <div className="relative z-10">{children}</div>
+    {/* Hover Glow Effect */}
     <div className={`absolute -right-10 -bottom-10 w-32 h-32 blur-[60px] opacity-0 group-hover:opacity-20 transition-opacity ${color.replace('bg-', 'bg-')}`} />
-  </motion.div>
+  </div>
 );
 
 const ChartBottomPanel: React.FC<Props> = ({ coin }) => {
-  if (!coin) return <div className="h-40 flex items-center justify-center text-gray-500 text-sm">Select a coin to analyze</div>;
+  if (!coin) {
+    return (
+      <div className="h-40 flex flex-col items-center justify-center text-gray-500 text-sm border border-white/5 rounded-xl bg-white/5">
+        <Activity size={24} className="mb-2 opacity-50" />
+        <span>Select a coin to analyze</span>
+      </div>
+    );
+  }
 
   const isLong = coin.signal === 'LONG' || coin.tag === 'AI';
   const colorClass = isLong ? 'bg-green-500' : (coin.signal === 'SHORT' ? 'bg-red-500' : 'bg-orange-500');
   const textColor = isLong ? 'text-green-400' : (coin.signal === 'SHORT' ? 'text-red-400' : 'text-orange-400');
 
+  // Depth fallback
+  const depth = coin.depthUSDT || (coin.quoteVolume ? coin.quoteVolume / 50 : 50000);
+
+  // Generate synthetic analysis text
   const reason = coin.tag === 'AI' 
     ? "Confirmed by DeepSeek. High confidence breakout pattern detected."
     : isLong 
-      ? `RSI is Oversold (${(Math.random()*10+20).toFixed(0)}). Price near support zone. Potential bounce.`
+      ? `RSI is Oversold (${(coin.rsi || 30).toFixed(0)}). Price near support zone. Potential bounce.`
       : coin.signal === 'SHORT'
-        ? `RSI is Overbought (${(Math.random()*10+70).toFixed(0)}). Price hit resistance. Correction likely.`
-        : "High volatility detected. Monitoring for breakout.";
+        ? `RSI is Overbought (${(coin.rsi || 70).toFixed(0)}). Price hit resistance. Correction likely.`
+        : "Market in equilibrium. Volatility is high.";
 
   return (
-    <div className="flex flex-col md:flex-row gap-4 mt-2 h-full min-h-[180px]">
+    <div className="flex flex-col md:flex-row gap-4 h-full min-h-[180px]">
+      
+      {/* 1. AI VERDICT */}
       <Card title="Signal Analysis" icon={Zap} color={colorClass}>
         <div className="flex items-center gap-3 mb-2">
           <span className={`text-2xl font-black ${textColor}`}>
             {coin.tag === 'AI' ? 'SNIPER ENTRY' : coin.signal || 'VOLATILE'}
           </span>
+          {coin.tag === 'AI' && <span className="bg-violet-600 text-white text-[10px] px-2 py-0.5 rounded shadow-lg">AI CONFIRMED</span>}
         </div>
         <p className="text-sm text-gray-300 leading-relaxed">
           {reason}
         </p>
       </Card>
 
+      {/* 2. MARKET DEPTH (Visual Mock) */}
       <Card title="Order Book Pressure" icon={BarChart2} color="bg-blue-500">
         <div className="flex justify-between text-xs mb-1">
           <span className="text-green-400">Bids (Buyers)</span>
@@ -61,12 +73,13 @@ const ChartBottomPanel: React.FC<Props> = ({ coin }) => {
         </div>
         <div className="flex justify-between items-center">
            <span className="text-lg font-mono font-bold text-white">
-             ${(coin.depthUSDT ? coin.depthUSDT/1000 : 0).toFixed(1)}k
+             ${(depth / 1000).toFixed(1)}k
            </span>
            <span className="text-xs text-gray-500">Wall Strength</span>
         </div>
       </Card>
 
+      {/* 3. KEY STATS */}
       <Card title="Technical Data" icon={Activity} color="bg-violet-500">
         <div className="grid grid-cols-2 gap-4">
           <div>

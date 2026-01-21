@@ -23,6 +23,8 @@ export interface DetectedCoin {
 interface ScannerState {
   coins: DetectedCoin[];
   nextScanAt?: number;
+  nextFtScan?: number;
+  nextAiScan?: number;
   isPremium: boolean;
   addDetectedCoin: (coin: DetectedCoin) => void;
   removeExpiredCoins: () => void;
@@ -30,11 +32,15 @@ interface ScannerState {
   setPremium: (status: boolean) => void;
   clear: () => void;
   setNextScanAt: (ts?: number) => void;
+  setNextFtScan: (ts?: number) => void;
+  setNextAiScan: (ts?: number) => void;
 }
 
 export const useScannerStore = create<ScannerState>((set) => ({
   coins: [],
   nextScanAt: undefined,
+  nextFtScan: undefined,
+  nextAiScan: undefined,
   isPremium: false,
 
   addDetectedCoin: (coin) => {
@@ -62,6 +68,8 @@ export const useScannerStore = create<ScannerState>((set) => ({
 
   clear: () => set({ coins: [] }),
   setNextScanAt: (ts) => set(() => ({ nextScanAt: ts })),
+  setNextFtScan: (ts) => set(() => ({ nextFtScan: ts })),
+  setNextAiScan: (ts) => set(() => ({ nextAiScan: ts })),
 }));
 
 setInterval(() => {

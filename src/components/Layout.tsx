@@ -23,6 +23,8 @@ const Layout: React.FC = () => {
   const coins = useScannerStore((s) => s.coins || []);
   const addDetectedCoin = useScannerStore((s) => s.addDetectedCoin);
   const setNextScanAt = useScannerStore((s) => s.setNextScanAt);
+  const setNextFtScan = useScannerStore((s) => s.setNextFtScan);
+  const setNextAiScan = useScannerStore((s) => s.setNextAiScan);
   const setPremium = useScannerStore((s) => s.setPremium);
 
   // Auth Check (Telegram)
@@ -64,7 +66,11 @@ const Layout: React.FC = () => {
     let es: EventSource | null = null;
     let alive = true;
     const ingest = (payload: any) => {
-      try { if (payload && payload.nextScanAt) setNextScanAt(Number(payload.nextScanAt)); } catch (_) {}
+      try { 
+        if (payload && payload.nextScanAt) setNextScanAt(Number(payload.nextScanAt)); 
+        if (payload && payload.nextFtScan) setNextFtScan(Number(payload.nextFtScan)); 
+        if (payload && payload.nextAiScan) setNextAiScan(Number(payload.nextAiScan)); 
+      } catch (_) {}
       const parsed = payload?.parsed || payload;
       const list = parsed?.detected;
       if (!Array.isArray(list)) return;
@@ -144,6 +150,19 @@ const Layout: React.FC = () => {
       <div className="fixed inset-0 pointer-events-none z-0">
          <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-violet-900/10 blur-[120px] rounded-full" />
          <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-blue-900/10 blur-[120px] rounded-full" />
+         <motion.div
+           className="absolute w-[30%] h-[30%] blur-[100px] rounded-full"
+           style={{ background: 'radial-gradient(circle, rgba(157,0,255,0.2) 0%, transparent 70%)' }}
+           animate={{
+             x: [0, 100, -50, 0],
+             y: [0, -50, 100, 0],
+           }}
+           transition={{
+             duration: 20,
+             repeat: Infinity,
+             ease: "linear",
+           }}
+         />
       </div>
 
       <div className="flex-1 flex w-full h-full relative z-10 gap-2 overflow-hidden p-2">
