@@ -34,13 +34,20 @@ const MIN_QUOTEVOL_AI = 1_000_000;
 
 const CHUNK_SIZE = 20;
 
+// у тебя были, оставляю (могут использоваться фронтом/логикой)
 const UI_INTERVAL = 300_000;
 const PRE_WORK_TIME = 45_000;
 
 const FT_INTERVAL = 60_000;
-const AI_INTERVAL = 300_000; // каждые 5 минут как ты просил
+const AI_INTERVAL = 300_000; // каждые 5 минут
 
 const SIGNAL_AUTO_REMOVE_MS = 3000;
+
+// IMPORTANT: максимум AI сигналов одновременно (чтобы не было AI=3)
+const AI_MAX_ACTIVE = 1;
+
+// IMPORTANT: серверный cooldown, чтобы монета не возвращалась как FT сразу после AI
+const COOLDOWN_MS = 15 * 60_000;
 
 const SILICON_KEY = process.env.SILICON_KEY || null;
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || null;
@@ -54,16 +61,24 @@ const CHANNEL_USERNAME = '@VortexAiOff';
 
 // ------------------- STATE -------------------
 let scanInFlight = false;
-let nextFtScan = 0;
-let nextAiScan = 0;
+
+// чтобы таймеры всегда были в будущем и не мигали на фронте
+let nextFtScan = Date.now() + FT_INTERVAL;
+let nextAiScan = Date.now() + AI_INTERVAL;
 
 const activeSignals = new Map(); // persistent AI signals
 let lastFtPicks = [];
+
+const cooldowns = new Map(); // symbol -> cooldownUntil
 
 const sseClients = new Set();
 const pendingVerifications = new Map();
 
 // ------------------- HELPERS -------------------
+function normalizeSymbol(s) {
+  return String(s || '').trim().toUpperCase();
+}
+
 function safeNum(x) {
   const n = Number(x);
   return Number.isFinite(n) ? n : null;
@@ -95,6 +110,36 @@ function isTokenizedStock(sym) {
   return /ONUSDT$/.test(sym);
 }
 
+function isInCooldown(symbol) {
+  const sym = normalizeSymbol(symbol);
+  const until = cooldowns.get(sym);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    cooldowns.delete(sym);
+    return false;
+  }
+  return true;
+}
+
+function putCooldown(symbol) {
+  cooldowns.set(normalizeSymbol(symbol), Date.now() + COOLDOWN_MS);
+}
+
+function cleanupCooldowns() {
+  const now = Date.now();
+  for (const [sym, until] of cooldowns.entries()) {
+    if (now >= until) cooldowns.delete(sym);
+  }
+}
+
+function countActiveAiActiveOnly() {
+  let n = 0;
+  for (const s of activeSignals.values()) {
+    if (s?.tag === 'AI' && String(s.status || '').toUpperCase() === 'ACTIVE') n++;
+  }
+  return n;
+}
+
 async function mexcFetchJSON(url) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), 10_000);
@@ -116,17 +161,13 @@ async function fetch24hrTickers() {
 }
 
 async function fetchMexcKlines(symbol, interval = '1m', limit = 50) {
-  const url = `https://api.mexc.com/api/v3/klines?symbol=${encodeURIComponent(
-    symbol
-  )}&interval=${interval}&limit=${limit}`;
+  const url = `https://api.mexc.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
   const data = await mexcFetchJSON(url);
   return Array.isArray(data) ? data : [];
 }
 
 async function fetchMexcDepth(symbol, limit = 20) {
-  const url = `https://api.mexc.com/api/v3/depth?symbol=${encodeURIComponent(
-    symbol
-  )}&limit=${limit}`;
+  const url = `https://api.mexc.com/api/v3/depth?symbol=${encodeURIComponent(symbol)}&limit=${limit}`;
   return mexcFetchJSON(url);
 }
 
@@ -214,9 +255,8 @@ function bollingerSqueezeScore(closes) {
   const last = bb[bb.length - 1];
   if (!last) return 0;
   const width = (last.upper - last.lower) / (last.middle || 1);
-  // меньше ширина => выше score
   if (width <= 0) return 0;
-  const score = clamp((0.03 - width) / 0.03, 0, 1); // squeeze ~ <3%
+  const score = clamp((0.03 - width) / 0.03, 0, 1);
   return score;
 }
 
@@ -226,7 +266,7 @@ function momentumScore(closes) {
   const c9 = closes[closes.length - 1];
   if (!c0) return 0;
   const move = Math.abs(c9 / c0 - 1);
-  return clamp(move / 0.03, 0, 1); // 3% за 10м = 1.0
+  return clamp(move / 0.03, 0, 1);
 }
 
 function volumeSpikeScore(volumes) {
@@ -235,11 +275,10 @@ function volumeSpikeScore(volumes) {
   const avg = volumes.slice(0, -1).reduce((s, v) => s + v, 0) / (volumes.length - 1);
   if (!avg) return 0;
   const spike = last / avg;
-  return clamp((spike - 1) / 3, 0, 1); // 4x => ~1
+  return clamp((spike - 1) / 3, 0, 1);
 }
 
 function rsiExtremesScore(rsi) {
-  // экстремумы дают шанс на быстрый откат/пробой
   if (!Number.isFinite(rsi)) return 0;
   const oversold = clamp((35 - rsi) / 20, 0, 1);
   const overbought = clamp((rsi - 65) / 20, 0, 1);
@@ -247,7 +286,6 @@ function rsiExtremesScore(rsi) {
 }
 
 function buildTop5Candidates(enriched) {
-  // enriched: [{symbol, quoteVolume, lastPrice, priceChangePercent, klines15, rsi, stdDev, scores...}]
   const scored = enriched.map((x) => {
     const closes10 = x.klines15.slice(-10).map((k) => Number(k[4]));
     const vols10 = x.klines15.slice(-10).map((k) => Number(k[5]));
@@ -258,7 +296,6 @@ function buildTop5Candidates(enriched) {
     const sRsi = rsiExtremesScore(x.rsi);
     const sStd = clamp((x.stdDev || 0) / 1.2, 0, 1);
 
-    // общий “аномальный” скоринг
     const score =
       0.30 * sVol +
       0.25 * sMom +
@@ -438,7 +475,10 @@ function updateSignalStatus(sig, price) {
     else if (price >= sig.stop_loss_price) { sig.status = 'LOST'; done = true; }
   }
 
-  if (done) sig.removeAt = Date.now() + SIGNAL_AUTO_REMOVE_MS;
+  if (done) {
+    sig.removeAt = Date.now() + SIGNAL_AUTO_REMOVE_MS;
+    putCooldown(sig.symbol); // КЛЮЧЕВО: не даём монете вернуться FT
+  }
   return done;
 }
 
@@ -473,7 +513,7 @@ function buildPayload() {
 
   return {
     ts: new Date().toISOString(),
-    nextScanAt: nextFtScan,
+    nextScanAt: nextFtScan, // fallback for old UI
     nextFtScan,
     nextAiScan,
     parsed: { detected: finalDetected, forecastsBySymbol },
@@ -491,11 +531,15 @@ function loadPersistedSignals() {
     const latest = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     const detected = latest?.parsed?.detected || [];
     const forecasts = latest?.parsed?.forecastsBySymbol || {};
+
     detected.forEach((d) => {
       if (d?.tag === 'AI' && d?.symbol) {
-        const f = forecasts[d.symbol];
-        activeSignals.set(d.symbol, {
+        const sym = normalizeSymbol(d.symbol);
+        const f = forecasts[sym] || forecasts[d.symbol];
+
+        activeSignals.set(sym, {
           ...d,
+          symbol: sym,
           target_price: f?.target_price ?? d.target_price,
           stop_loss_price: f?.stop_loss_price ?? d.stop_loss_price,
           direction: f?.direction ?? d.direction,
@@ -507,6 +551,23 @@ function loadPersistedSignals() {
         });
       }
     });
+
+    // IMPORTANT: если после восстановления >1 ACTIVE — оставляем только самый свежий ACTIVE
+    const actives = Array.from(activeSignals.values())
+      .filter((s) => s?.tag === 'AI' && String(s.status || '').toUpperCase() === 'ACTIVE')
+      .sort((a, b) => Number(b.addedAt || b.detectedAt || 0) - Number(a.addedAt || a.detectedAt || 0));
+
+    if (actives.length > AI_MAX_ACTIVE) {
+      const keep = new Set(actives.slice(0, AI_MAX_ACTIVE).map((s) => normalizeSymbol(s.symbol)));
+      for (const [sym, sig] of activeSignals.entries()) {
+        if (sig?.tag !== 'AI') continue;
+        const st = String(sig.status || '').toUpperCase();
+        if (st === 'ACTIVE' && !keep.has(sym)) {
+          sig.status = 'STALE';
+          sig.removeAt = Date.now() + SIGNAL_AUTO_REMOVE_MS;
+        }
+      }
+    }
   } catch (_) {}
 }
 
@@ -523,7 +584,7 @@ async function runScannerJob() {
 
     const base = all
       .map((x) => ({
-        symbol: x.symbol,
+        symbol: normalizeSymbol(x.symbol),
         quoteVolume: Number(x.quoteVolume),
         lastPrice: Number(x.lastPrice),
         priceChangePercent: Number(x.priceChangePercent),
@@ -545,79 +606,89 @@ async function runScannerJob() {
       sig.price = price;
       if (sig.status === 'ACTIVE') updateSignalStatus(sig, price);
     }
-    cleanupExpiredSignals();
 
-    // 2) AI scan every 5 minutes (your concept)
-    if (now >= nextAiScan && activeSignals.size < 5) {
+    cleanupExpiredSignals();
+    cleanupCooldowns();
+
+    // 2) AI scan (но максимум 1 ACTIVE одновременно)
+    if (now >= nextAiScan) {
+      // Всегда двигаем таймер вперёд, чтобы не было спама попыток
       nextAiScan = now + AI_INTERVAL;
 
-      // Preselect pool by liquidity + basic movement
-      const pool = base
-        .filter((x) => x.lastPrice >= MIN_PRICE_AI)
-        .filter((x) => x.quoteVolume >= MIN_QUOTEVOL_AI)
-        .filter((x) => !['BTCUSDT', 'ETHUSDT'].includes(x.symbol))
-        .sort((a, b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent))
-        .slice(0, 25); // быстро и достаточно
+      if (countActiveAiActiveOnly() < AI_MAX_ACTIVE) {
+        const pool = base
+          .filter((x) => x.lastPrice >= MIN_PRICE_AI)
+          .filter((x) => x.quoteVolume >= MIN_QUOTEVOL_AI)
+          .filter((x) => !['BTCUSDT', 'ETHUSDT'].includes(x.symbol))
+          .filter((x) => !isInCooldown(x.symbol))
+          .sort((a, b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent))
+          .slice(0, 25);
 
-      // Enrich with 15 candles for anomaly scoring
-      const enriched = [];
-      for (const c of pool) {
-        const kl = await fetchMexcKlines(c.symbol, '1m', 15);
-        if (!kl || kl.length < 15) continue;
-        const closes = kl.map((k) => Number(k[4]));
-        enriched.push({
-          symbol: c.symbol,
-          price: c.lastPrice,
-          quoteVolume: c.quoteVolume,
-          priceChangePercent: c.priceChangePercent,
-          klines15: kl,
-          rsi: calculateRSI(closes, 14),
-          stdDev: relStdDevPct(closes),
-        });
-      }
+        const enriched = [];
+        for (const c of pool) {
+          const kl = await fetchMexcKlines(c.symbol, '1m', 15);
+          if (!kl || kl.length < 15) continue;
+          const closes = kl.map((k) => Number(k[4]));
+          enriched.push({
+            symbol: c.symbol,
+            price: c.lastPrice,
+            quoteVolume: c.quoteVolume,
+            priceChangePercent: c.priceChangePercent,
+            klines15: kl,
+            rsi: calculateRSI(closes, 14),
+            stdDev: relStdDevPct(closes),
+          });
+        }
 
-      const top5 = buildTop5Candidates(enriched);
+        const top5 = buildTop5Candidates(enriched);
 
-      if (top5.length > 0) {
-        console.log('🧠 AI Stage 1: selecting winner from top5...');
-        const winner = await deepseekSelectWinner(top5);
+        if (top5.length > 0) {
+          console.log('🧠 AI Stage 1: selecting winner from top5...');
+          const winner = await deepseekSelectWinner(top5);
 
-        if (winner) {
-          console.log('🏆 Winner chosen:', winner.symbol);
-          console.log('🧠 AI Stage 2: execution...');
-          const exec = await deepseekExecution(winner);
+          if (winner && countActiveAiActiveOnly() < AI_MAX_ACTIVE) {
+            console.log('🏆 Winner chosen:', winner.symbol);
+            console.log('🧠 AI Stage 2: execution...');
+            const exec = await deepseekExecution(winner);
 
-          if (exec) {
-            activeSignals.set(winner.symbol, {
-              symbol: winner.symbol,
-              tag: 'AI',
-              price: winner.price,
-              quoteVolume: winner.quoteVolume,
-              change24hPct: winner.priceChangePercent ?? 0,
-              stdDev: winner.stdDev ?? 0,
+            if (exec) {
+              const sym = normalizeSymbol(winner.symbol);
 
-              target_price: exec.target_price,
-              stop_loss_price: exec.stop_loss_price,
-              direction: exec.direction,
-              confidence: exec.confidence ?? 0,
-              forecastCandles: exec.candles || [],
+              // если монета в cooldown — не ставим
+              if (!isInCooldown(sym)) {
+                activeSignals.set(sym, {
+                  symbol: sym,
+                  tag: 'AI',
+                  price: winner.price,
+                  quoteVolume: winner.quoteVolume,
+                  change24hPct: winner.priceChangePercent ?? 0,
+                  stdDev: winner.stdDev ?? 0,
 
-              detectedAt: Date.now(),
-              status: 'ACTIVE',
-              addedAt: Date.now(),
-              source: exec.source || 'deepseek',
-            });
+                  target_price: exec.target_price,
+                  stop_loss_price: exec.stop_loss_price,
+                  direction: exec.direction,
+                  confidence: exec.confidence ?? 0,
+                  forecastCandles: exec.candles || [],
+
+                  detectedAt: Date.now(),
+                  status: 'ACTIVE',
+                  addedAt: Date.now(),
+                  source: exec.source || 'deepseek',
+                });
+              }
+            }
           }
         }
       }
     }
 
-    // 3) FT scan every 1 minute
+    // 3) FT scan every 1 minute (snapshot + cooldown filter + expiresAt = nextFtScan)
     if (now >= nextFtScan) {
       nextFtScan = now + FT_INTERVAL;
 
       const ftPool = base
         .filter((x) => !activeSignals.has(x.symbol))
+        .filter((x) => !isInCooldown(x.symbol))
         .filter((x) => x.quoteVolume >= MIN_QUOTEVOL_FT && x.lastPrice >= MIN_PRICE_FT)
         .sort((a, b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent))
         .slice(0, 60);
@@ -629,6 +700,7 @@ async function runScannerJob() {
           chunk.map(async (t) => {
             const k = await fetchMexcKlines(t.symbol, '1m', 20);
             if (!k || k.length < 15) return;
+
             const closes = k.map((x) => Number(x[4]));
             const rsi = calculateRSI(closes, 14);
 
@@ -647,7 +719,8 @@ async function runScannerJob() {
               signal,
               stdDev: relStdDevPct(closes),
               detectedAt: Date.now(),
-              expiresAt: Date.now() + 600_000,
+              // КЛЮЧЕВО: FT живёт до следующего FT-скана
+              expiresAt: nextFtScan,
             });
           })
         );
@@ -656,12 +729,14 @@ async function runScannerJob() {
       const longs = ftPicks.filter((f) => f.signal === 'LONG').slice(0, 7);
       const shorts = ftPicks.filter((f) => f.signal === 'SHORT').slice(0, 7);
       const vols = ftPicks.filter((f) => f.signal === 'NEUTRAL').slice(0, 6);
+
+      // snapshot overwrite
       lastFtPicks = [...longs, ...shorts, ...vols];
     }
 
     const payload = buildPayload();
     persistAndBroadcast(payload);
-    console.log(`✅ Update: AI=${activeSignals.size}, FT=${lastFtPicks.length}`);
+    console.log(`✅ Update: AI(active)=${countActiveAiActiveOnly()}, AI(total)=${activeSignals.size}, FT=${lastFtPicks.length}`);
 
   } catch (e) {
     console.error(e);
@@ -713,7 +788,7 @@ let notifyProUsers = async (message) => {
   console.log('[notifyProUsers] noop', message);
 };
 
-// ------------------- TELEGRAM BOT (оставил как есть, чтобы не ломать) -------------------
+// ------------------- TELEGRAM BOT (как у тебя, не ломаю) -------------------
 const TEXTS = {
   ru: {
     welcome: "👋 Добро пожаловать в Vortex AI!\n\nПожалуйста, подпишитесь на наш канал, чтобы продолжить.",
@@ -808,7 +883,7 @@ if (TG_BOT_TOKEN) {
   }
 }
 
-// ------------------- WEBAPP API (ВАЖНО ДЛЯ СПИСКА) -------------------
+// ------------------- WEBAPP API -------------------
 app.get('/api/user/status', async (req, res) => {
   const id = req.query.tg_id;
   const hasAccess = await checkUser(id);
@@ -841,9 +916,8 @@ app.get('/events', (req, res) => {
   });
 });
 
-// live candles endpoints (если у тебя используются на чарте)
 app.get('/api/live/candles', async (req, res) => {
-  const symbol = String(req.query.symbol || 'BTCUSDT').toUpperCase();
+  const symbol = normalizeSymbol(req.query.symbol || 'BTCUSDT');
   const limit = Number(req.query.limit || 100);
   const kl = await fetchMexcKlines(symbol, '1m', limit);
   res.json(kl.map(k => ({
@@ -863,7 +937,7 @@ app.get('/api/live/stream', (req, res) => {
     'Access-Control-Allow-Origin': '*',
   });
 
-  const sym = String(req.query.symbol || 'BTCUSDT').toUpperCase();
+  const sym = normalizeSymbol(req.query.symbol || 'BTCUSDT');
   const iv = setInterval(async () => {
     const kl = await fetchMexcKlines(sym, '1m', 1);
     if (kl.length) {
