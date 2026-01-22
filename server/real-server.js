@@ -228,7 +228,6 @@ function validateAiOutput(obj, lastClose) {
   if (!tp || !sl) return null;
   if (dir !== 'LONG' && dir !== 'SHORT') return null;
 
-  // sanity: tp/sl не должны быть слишком далеко для 5-20 минут
   const tpMove = Math.abs(tp / lastClose - 1);
   const slMove = Math.abs(sl / lastClose - 1);
   if (tpMove > 0.08 || slMove > 0.08) return null;
@@ -477,7 +476,7 @@ function updateSignalStatus(sig, price) {
 
   if (done) {
     sig.removeAt = Date.now() + SIGNAL_AUTO_REMOVE_MS;
-    putCooldown(sig.symbol); // КЛЮЧЕВО: не даём монете вернуться FT
+    putCooldown(sig.symbol);
   }
   return done;
 }
@@ -513,7 +512,7 @@ function buildPayload() {
 
   return {
     ts: new Date().toISOString(),
-    nextScanAt: nextFtScan, // fallback for old UI
+    nextScanAt: nextFtScan,
     nextFtScan,
     nextAiScan,
     parsed: { detected: finalDetected, forecastsBySymbol },
@@ -531,12 +530,10 @@ function loadPersistedSignals() {
     const latest = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     const detected = latest?.parsed?.detected || [];
     const forecasts = latest?.parsed?.forecastsBySymbol || {};
-
     detected.forEach((d) => {
       if (d?.tag === 'AI' && d?.symbol) {
         const sym = normalizeSymbol(d.symbol);
         const f = forecasts[sym] || forecasts[d.symbol];
-
         activeSignals.set(sym, {
           ...d,
           symbol: sym,
@@ -551,23 +548,6 @@ function loadPersistedSignals() {
         });
       }
     });
-
-    // IMPORTANT: если после восстановления >1 ACTIVE — оставляем только самый свежий ACTIVE
-    const actives = Array.from(activeSignals.values())
-      .filter((s) => s?.tag === 'AI' && String(s.status || '').toUpperCase() === 'ACTIVE')
-      .sort((a, b) => Number(b.addedAt || b.detectedAt || 0) - Number(a.addedAt || a.detectedAt || 0));
-
-    if (actives.length > AI_MAX_ACTIVE) {
-      const keep = new Set(actives.slice(0, AI_MAX_ACTIVE).map((s) => normalizeSymbol(s.symbol)));
-      for (const [sym, sig] of activeSignals.entries()) {
-        if (sig?.tag !== 'AI') continue;
-        const st = String(sig.status || '').toUpperCase();
-        if (st === 'ACTIVE' && !keep.has(sym)) {
-          sig.status = 'STALE';
-          sig.removeAt = Date.now() + SIGNAL_AUTO_REMOVE_MS;
-        }
-      }
-    }
   } catch (_) {}
 }
 
@@ -575,8 +555,6 @@ function loadPersistedSignals() {
 async function runScannerJob() {
   if (scanInFlight) return;
   scanInFlight = true;
-
-  console.log('\n🔍 Running IDEAL 2-Stage Scanner...');
 
   try {
     const all = await fetch24hrTickers();
@@ -598,7 +576,6 @@ async function runScannerJob() {
     const baseMap = new Map(base.map((b) => [b.symbol, b]));
     const now = Date.now();
 
-    // 1) update active signals
     for (const [sym, sig] of activeSignals.entries()) {
       const tick = baseMap.get(sym);
       if (!tick) continue;
@@ -610,9 +587,8 @@ async function runScannerJob() {
     cleanupExpiredSignals();
     cleanupCooldowns();
 
-    // 2) AI scan (но максимум 1 ACTIVE одновременно)
+    // AI scan
     if (now >= nextAiScan) {
-      // Всегда двигаем таймер вперёд, чтобы не было спама попыток
       nextAiScan = now + AI_INTERVAL;
 
       if (countActiveAiActiveOnly() < AI_MAX_ACTIVE) {
@@ -641,48 +617,35 @@ async function runScannerJob() {
         }
 
         const top5 = buildTop5Candidates(enriched);
-
         if (top5.length > 0) {
-          console.log('🧠 AI Stage 1: selecting winner from top5...');
           const winner = await deepseekSelectWinner(top5);
-
           if (winner && countActiveAiActiveOnly() < AI_MAX_ACTIVE) {
-            console.log('🏆 Winner chosen:', winner.symbol);
-            console.log('🧠 AI Stage 2: execution...');
             const exec = await deepseekExecution(winner);
-
-            if (exec) {
-              const sym = normalizeSymbol(winner.symbol);
-
-              // если монета в cooldown — не ставим
-              if (!isInCooldown(sym)) {
-                activeSignals.set(sym, {
-                  symbol: sym,
-                  tag: 'AI',
-                  price: winner.price,
-                  quoteVolume: winner.quoteVolume,
-                  change24hPct: winner.priceChangePercent ?? 0,
-                  stdDev: winner.stdDev ?? 0,
-
-                  target_price: exec.target_price,
-                  stop_loss_price: exec.stop_loss_price,
-                  direction: exec.direction,
-                  confidence: exec.confidence ?? 0,
-                  forecastCandles: exec.candles || [],
-
-                  detectedAt: Date.now(),
-                  status: 'ACTIVE',
-                  addedAt: Date.now(),
-                  source: exec.source || 'deepseek',
-                });
-              }
+            if (exec && !isInCooldown(winner.symbol)) {
+              activeSignals.set(normalizeSymbol(winner.symbol), {
+                symbol: normalizeSymbol(winner.symbol),
+                tag: 'AI',
+                price: winner.price,
+                quoteVolume: winner.quoteVolume,
+                change24hPct: winner.priceChangePercent ?? 0,
+                stdDev: winner.stdDev ?? 0,
+                target_price: exec.target_price,
+                stop_loss_price: exec.stop_loss_price,
+                direction: exec.direction,
+                confidence: exec.confidence ?? 0,
+                forecastCandles: exec.candles || [],
+                detectedAt: Date.now(),
+                status: 'ACTIVE',
+                addedAt: Date.now(),
+                source: exec.source || 'deepseek',
+              });
             }
           }
         }
       }
     }
 
-    // 3) FT scan every 1 minute (snapshot + cooldown filter + expiresAt = nextFtScan)
+    // FT scan
     if (now >= nextFtScan) {
       nextFtScan = now + FT_INTERVAL;
 
@@ -719,7 +682,6 @@ async function runScannerJob() {
               signal,
               stdDev: relStdDevPct(closes),
               detectedAt: Date.now(),
-              // КЛЮЧЕВО: FT живёт до следующего FT-скана
               expiresAt: nextFtScan,
             });
           })
@@ -729,14 +691,11 @@ async function runScannerJob() {
       const longs = ftPicks.filter((f) => f.signal === 'LONG').slice(0, 7);
       const shorts = ftPicks.filter((f) => f.signal === 'SHORT').slice(0, 7);
       const vols = ftPicks.filter((f) => f.signal === 'NEUTRAL').slice(0, 6);
-
-      // snapshot overwrite
       lastFtPicks = [...longs, ...shorts, ...vols];
     }
 
     const payload = buildPayload();
     persistAndBroadcast(payload);
-    console.log(`✅ Update: AI(active)=${countActiveAiActiveOnly()}, AI(total)=${activeSignals.size}, FT=${lastFtPicks.length}`);
 
   } catch (e) {
     console.error(e);
@@ -788,80 +747,49 @@ let notifyProUsers = async (message) => {
   console.log('[notifyProUsers] noop', message);
 };
 
-// ------------------- TELEGRAM BOT (как у тебя, не ломаю) -------------------
+// ------------------- TELEGRAM BOT (FIXED SUB BUTTON) -------------------
+const CHANNEL_URL = `https://t.me/${CHANNEL_USERNAME.replace('@', '')}`;
+
 const TEXTS = {
   ru: {
+    // сообщение для НЕ подписанного
     welcome: "👋 Добро пожаловать в Vortex AI!\n\nПожалуйста, подпишитесь на наш канал, чтобы продолжить.",
+    // сообщение для подписанного
+    welcome_ok: "✅ Подписка подтверждена.\n\nОткройте приложение:",
     sub_check: "🔄 Проверить подписку",
-    sub_error: "❌ Вы не подписаны на канал.",
-    lang_select: "🌐 Выберите язык / Select Language:",
-    menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Рынок", settings: "⚙️ Настройки", help: "❓ Помощь" },
-    market: "🔄 Сканирую рынок...",
-    profile: "👤 **ПРОФИЛЬ**",
-    no_sub: "❌ Нет подписки",
-    days_left: "дней",
-    app_desc: "📱 **Vortex Web App**\n\nНажмите кнопку ниже, чтобы запустить:",
-    settings: "⚙️ **Настройки**",
-    alerts: "🔔 Уведомления AI:",
-    lang_btn: "🌐 Сменить Язык",
-    help: "Support: @meanfive1",
-    disclaimer: "Торговля — риск. Возврата нет.",
-    agree_pay: "✅ Согласен, Оплатить",
-    premium_buy: "💎 VORTEX PRO",
-    pay_methods: { crypto: "Crypto", stars: "Stars", card: "Card" },
-    manual_pay: "Напиши менеджеру.",
-    btn_manager: "Менеджер",
-    btn_paid: "Я оплатил",
-    btn_back: "Назад",
+    menu: { app: "🚀 Vortex App" },
   },
   en: {
     welcome: "👋 Welcome to Vortex AI!\n\nPlease subscribe to our channel to continue.",
-    sub_check: "🔄 Check Subscription",
-    sub_error: "❌ You are not subscribed.",
-    lang_select: "🌐 Select Language:",
-    menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Market", settings: "⚙️ Settings", help: "❓ Help" },
-    market: "🔄 Scanning...",
-    profile: "👤 **PROFILE**",
-    no_sub: "❌ No Subscription",
-    days_left: "days",
-    app_desc: "📱 **Vortex Web App**\n\nClick below to launch:",
-    settings: "⚙️ **Settings**",
-    alerts: "🔔 AI Alerts:",
-    lang_btn: "🌐 Change Language",
-    help: "Support: @meanfive1",
-    disclaimer: "Trading involves risk. No refunds.",
-    agree_pay: "✅ I Agree & Pay",
-    premium_buy: "💎 VORTEX PRO",
-    pay_methods: { crypto: "Crypto", stars: "Stars", card: "Card" },
-    manual_pay: "Contact manager.",
-    btn_manager: "Manager",
-    btn_paid: "I paid",
-    btn_back: "Back",
+    welcome_ok: "✅ Subscription confirmed.\n\nOpen the app:",
+    sub_check: "🔄 Check subscription",
+    menu: { app: "🚀 Vortex App" },
   }
 };
 
-// --- TELEGRAM BOT (fixed start) ---
+async function isSubscribed(botInstance, userId) {
+  try {
+    const member = await botInstance.telegram.getChatMember(CHANNEL_USERNAME, userId);
+    return !['left', 'kicked'].includes(member.status);
+  } catch (e) {
+    // если проверка упала (бот не админ в канале/приватность) — не блокируем навсегда
+    console.warn('[bot] getChatMember failed:', e?.message || e);
+    return true;
+  }
+}
+
 if (TG_BOT_TOKEN) {
   (async () => {
     try {
-      console.log('[bot] token exists:', !!TG_BOT_TOKEN);
-
       const bot = new Telegraf(TG_BOT_TOKEN);
 
-      // ловим любые ошибки внутри обработчиков
-      bot.catch((err) => {
-        console.error('[bot] runtime error:', err);
-      });
+      bot.catch((err) => console.error('[bot] runtime error:', err));
 
-      // критично: если webhook был включен — polling не будет работать
+      // webhook off -> polling
       try {
         await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-        console.log('[bot] webhook cleared');
-      } catch (e) {
-        console.warn('[bot] deleteWebhook failed:', e?.message || e);
-      }
+      } catch (_) {}
 
-      // минимальные команды (оставил твою логику)
       bot.command('start', async (ctx) => {
         await ctx.reply('🌐 Choose language / Выберите язык', Markup.inlineKeyboard([
           Markup.button.callback('🇷🇺 Русский', 'lang_ru'),
@@ -869,17 +797,44 @@ if (TG_BOT_TOKEN) {
         ]));
       });
 
+      // показываем либо канал, либо webapp
+      const showGate = async (ctx, lang) => {
+        const T = TEXTS[lang] || TEXTS.ru;
+        const ok = await isSubscribed(bot, ctx.from.id);
+
+        if (!ok) {
+          // ВАЖНО: тут кнопка ведёт на канал, как ты просил
+          return ctx.reply(
+            T.welcome,
+            Markup.inlineKeyboard([
+              [Markup.button.url('📢 Channel', CHANNEL_URL)],
+              [Markup.button.callback(T.sub_check, 'check_sub')]
+            ])
+          );
+        }
+
+        // подписан -> webapp
+        return ctx.reply(
+          T.welcome_ok,
+          Markup.inlineKeyboard([
+            [Markup.button.webApp(T.menu.app, WEBAPP_URL)]
+          ])
+        );
+      };
+
       bot.action(/^lang_(.+)$/, async (ctx) => {
-        const lang = ctx.match[1];
-        try {
-          await User.findOneAndUpdate({ tgId: String(ctx.from.id) }, { language: lang }, { upsert: true });
-        } catch (_) {}
+        const lang = ctx.match[1] === 'en' ? 'en' : 'ru';
+        try { await User.findOneAndUpdate({ tgId: String(ctx.from.id) }, { language: lang }, { upsert: true }); } catch (_) {}
         await ctx.answerCbQuery();
         try { await ctx.deleteMessage(); } catch (_) {}
-        const T = TEXTS[lang] || TEXTS['ru'];
-        await ctx.reply(T.welcome, Markup.inlineKeyboard([
-          Markup.button.webApp(T.menu.app, WEBAPP_URL)
-        ]));
+        await showGate(ctx, lang);
+      });
+
+      bot.action('check_sub', async (ctx) => {
+        const u = await User.findOne({ tgId: String(ctx.from.id) }).catch(() => null);
+        const lang = u?.language === 'en' ? 'en' : 'ru';
+        await ctx.answerCbQuery();
+        await showGate(ctx, lang);
       });
 
       bot.command('admin', async (ctx) => {
@@ -887,12 +842,12 @@ if (TG_BOT_TOKEN) {
         await ctx.reply('ADMIN');
       });
 
-      // launch polling
       await bot.launch({ dropPendingUpdates: true });
       console.log('[bot] started (polling)');
 
       process.once('SIGINT', () => bot.stop('SIGINT'));
       process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
     } catch (e) {
       console.error('[bot] failed to start:', e?.message || e);
     }
