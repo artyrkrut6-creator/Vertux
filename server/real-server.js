@@ -840,47 +840,65 @@ const TEXTS = {
   }
 };
 
+// --- TELEGRAM BOT (fixed start) ---
 if (TG_BOT_TOKEN) {
-  try {
-    const bot = new Telegraf(TG_BOT_TOKEN);
+  (async () => {
+    try {
+      console.log('[bot] token exists:', !!TG_BOT_TOKEN);
 
-    const getMenu = (lang) => {
-      const T = TEXTS[lang] || TEXTS['ru'];
-      return Markup.keyboard([[T.menu.app, T.menu.premium], [T.menu.market, T.menu.settings], [T.menu.help]]).resize();
-    };
+      const bot = new Telegraf(TG_BOT_TOKEN);
 
-    const getT = async (ctx) => {
-      const u = await User.findOne({ tgId: String(ctx.from.id) });
-      return TEXTS[u?.language || 'ru'] || TEXTS['ru'];
-    };
+      // ловим любые ошибки внутри обработчиков
+      bot.catch((err) => {
+        console.error('[bot] runtime error:', err);
+      });
 
-    bot.command('start', async (ctx) => {
-      await ctx.reply('🌐 Choose language / Выберите язык', Markup.inlineKeyboard([
-        Markup.button.callback('🇷🇺 Русский', 'lang_ru'),
-        Markup.button.callback('🇺🇸 English', 'lang_en')
-      ]));
-    });
+      // критично: если webhook был включен — polling не будет работать
+      try {
+        await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+        console.log('[bot] webhook cleared');
+      } catch (e) {
+        console.warn('[bot] deleteWebhook failed:', e?.message || e);
+      }
 
-    bot.action(/^lang_(.+)$/, async (ctx) => {
-      const lang = ctx.match[1];
-      await User.findOneAndUpdate({ tgId: String(ctx.from.id) }, { language: lang }, { upsert: true });
-      await ctx.answerCbQuery();
-      try { await ctx.deleteMessage(); } catch (_) {}
-      const T = TEXTS[lang] || TEXTS['ru'];
-      await ctx.reply(T.welcome, getMenu(lang));
-    });
+      // минимальные команды (оставил твою логику)
+      bot.command('start', async (ctx) => {
+        await ctx.reply('🌐 Choose language / Выберите язык', Markup.inlineKeyboard([
+          Markup.button.callback('🇷🇺 Русский', 'lang_ru'),
+          Markup.button.callback('🇺🇸 English', 'lang_en')
+        ]));
+      });
 
-    bot.command('admin', async (ctx) => {
-      if (String(ctx.from.id) !== String(ADMIN_ID)) return;
-      ctx.reply('ADMIN');
-    });
+      bot.action(/^lang_(.+)$/, async (ctx) => {
+        const lang = ctx.match[1];
+        try {
+          await User.findOneAndUpdate({ tgId: String(ctx.from.id) }, { language: lang }, { upsert: true });
+        } catch (_) {}
+        await ctx.answerCbQuery();
+        try { await ctx.deleteMessage(); } catch (_) {}
+        const T = TEXTS[lang] || TEXTS['ru'];
+        await ctx.reply(T.welcome, Markup.inlineKeyboard([
+          Markup.button.webApp(T.menu.app, WEBAPP_URL)
+        ]));
+      });
 
-    bot.launch().then(() => console.log('[bot] started'));
-    process.once('SIGINT', () => bot.stop('SIGINT'));
-    process.once('SIGTERM', () => bot.stop('SIGTERM'));
-  } catch (e) {
-    console.error('Bot Error:', e);
-  }
+      bot.command('admin', async (ctx) => {
+        if (String(ctx.from.id) !== String(ADMIN_ID)) return;
+        await ctx.reply('ADMIN');
+      });
+
+      // launch polling
+      await bot.launch({ dropPendingUpdates: true });
+      console.log('[bot] started (polling)');
+
+      process.once('SIGINT', () => bot.stop('SIGINT'));
+      process.once('SIGTERM', () => bot.stop('SIGTERM'));
+    } catch (e) {
+      console.error('[bot] failed to start:', e?.message || e);
+    }
+  })();
+} else {
+  console.log('[bot] TG_BOT_TOKEN missing, bot disabled');
 }
 
 // ------------------- WEBAPP API -------------------
