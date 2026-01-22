@@ -1,7 +1,19 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import useScannerStore from '../store/scannerStore';
 import logoSrc from '/nonfon.png';
-import { Flame, Clock, Filter, X, Check, BarChart3, ScanLine, Search, CheckCircle, XCircle, Lock } from 'lucide-react';
+import {
+  Flame,
+  Clock,
+  Filter,
+  X,
+  Check,
+  BarChart3,
+  ScanLine,
+  Search,
+  CheckCircle,
+  XCircle,
+  Lock
+} from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 interface Props {
@@ -9,9 +21,8 @@ interface Props {
   selected?: string;
 }
 
-// Helpers
 function fmtMMSS(ms: number) {
-  if (ms <= 0) return "00:00";
+  if (!Number.isFinite(ms) || ms <= 0) return '00:00';
   const s = Math.floor(ms / 1000);
   const mm = Math.floor(s / 60);
   const ss = s % 60;
@@ -37,10 +48,13 @@ function fmtPrice(p: number) {
   return v.toFixed(d).replace(/\.?0+$/, '');
 }
 
+const FT_INTERVAL_MS = 60_000;
+
 const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
-  const { coins, nextScanAt, isPremium } = useScannerStore((state) => ({
+  const { coins, nextFtScan, nextScanAt, isPremium } = useScannerStore((state) => ({
     coins: state.coins,
-    nextScanAt: state.nextScanAt,
+    nextFtScan: state.nextFtScan,
+    nextScanAt: state.nextScanAt, // fallback
     isPremium: state.isPremium
   }));
 
@@ -64,47 +78,59 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
   }, []);
 
   const containerClass = isMobile ? 'w-full h-full flex flex-col p-0' : 'w-[360px] h-full flex flex-col p-2';
-  const panelClass = isMobile ? 'flex-1 bg-black/90 overflow-hidden flex flex-col relative' : 'flex-1 rounded-2xl border border-white/10 bg-white/5 backdrop-blur-xl overflow-hidden flex flex-col shadow-2xl relative';
+  const panelClass = isMobile
+    ? 'flex-1 bg-black/90 overflow-hidden flex flex-col relative'
+    : 'flex-1 rounded-2xl border border-white/10 bg-white/5 backdrop-blur-xl overflow-hidden flex flex-col shadow-2xl relative';
 
   const sorted = useMemo(() => {
     const q = String(searchQuery || '').trim().toUpperCase();
-    
-    return coins.filter(c => {
-      if (activeFilter === 'AI' && c.tag !== 'AI') return false;
-      if (activeFilter === 'LONG' && c.signal !== 'LONG') return false;
-      if (activeFilter === 'SHORT' && c.signal !== 'SHORT') return false;
-      if (q && !String(c.symbol || '').toUpperCase().includes(q)) return false;
-      return true;
-    }).sort((a, b) => {
-      if (a.tag === 'AI' && b.tag !== 'AI') return -1;
-      if (a.tag !== 'AI' && b.tag === 'AI') return 1;
-      return (b.quoteVolume || 0) - (a.quoteVolume || 0);
-    });
+
+    return coins
+      .filter((c) => {
+        if (activeFilter === 'AI' && c.tag !== 'AI') return false;
+        if (activeFilter === 'LONG' && c.signal !== 'LONG') return false;
+        if (activeFilter === 'SHORT' && c.signal !== 'SHORT') return false;
+        if (q && !String(c.symbol || '').toUpperCase().includes(q)) return false;
+        return true;
+      })
+      .sort((a, b) => {
+        if (a.tag === 'AI' && b.tag !== 'AI') return -1;
+        if (a.tag !== 'AI' && b.tag === 'AI') return 1;
+        return (b.quoteVolume || 0) - (a.quoteVolume || 0);
+      });
   }, [coins, activeFilter, searchQuery]);
 
-  // Global Scan Timer
-  const timeToNextScan = Math.max(0, (nextScanAt || 0) - now);
-  const isScanning = timeToNextScan <= 0;
-  const scanProgress = Math.min(100, Math.max(0, (1 - timeToNextScan / 300000) * 100));
+  // FT Timer: 60 sec countdown from nextFtScan
+  const effectiveNext = Number(nextFtScan || nextScanAt || 0);
+  const hasTimer = effectiveNext > 0;
+
+  const timeToNextScan = hasTimer ? Math.max(0, effectiveNext - now) : 0;
+  const isScanning = !hasTimer || effectiveNext - now <= 0;
+
+  const scanProgress = hasTimer
+    ? Math.min(100, Math.max(0, ((FT_INTERVAL_MS - timeToNextScan) / FT_INTERVAL_MS) * 100))
+    : 0;
 
   return (
     <aside className={containerClass}>
       <div className={panelClass}>
-        
-        {/* --- HEADER --- */}
+        {/* HEADER */}
         <div className="p-4 border-b border-white/10 bg-black/40 flex justify-between items-center z-20">
           <div className="flex items-center gap-3">
-            {/* Logo Image */}
             <div className="relative w-10 h-10">
-               <div className="absolute inset-0 bg-violet-500 blur-xl opacity-40 rounded-full"></div>
-               {!logoBroken ? (
-                 <img src={logoSrc} alt="Vortex Logo" onError={() => setLogoBroken(true)} className="relative w-full h-full object-contain drop-shadow-[0_0_5px_rgba(139,92,246,0.5)]" />
-               ) : (
-                 <div className="w-full h-full flex items-center justify-center text-white font-bold">V</div>
-               )}
+              <div className="absolute inset-0 bg-violet-500 blur-xl opacity-40 rounded-full"></div>
+              {!logoBroken ? (
+                <img
+                  src={logoSrc}
+                  alt="Vortex Logo"
+                  onError={() => setLogoBroken(true)}
+                  className="relative w-full h-full object-contain drop-shadow-[0_0_5px_rgba(139,92,246,0.5)]"
+                />
+              ) : (
+                <div className="w-full h-full flex items-center justify-center text-white font-bold">V</div>
+              )}
             </div>
-            
-            {/* Brand Text */}
+
             <div className="flex flex-col justify-center">
               <h1 className="text-xl font-black tracking-widest text-white leading-none font-[Eurostile,sans-serif]">
                 VORTEX <span className="text-violet-500">AI</span>
@@ -114,22 +140,24 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
               </span>
             </div>
           </div>
-          
+
           <div className="flex items-center gap-2">
             <div className={`w-2 h-2 rounded-full ${isScanning ? 'bg-yellow-400 animate-ping' : 'bg-green-500'}`} />
-            <button 
+            <button
               onClick={() => setFilterOpen(!filterOpen)}
-              className={`p-2 rounded-full transition-all ${filterOpen ? 'bg-white/20 text-white' : 'bg-white/5 text-gray-400 hover:text-white'}`}
+              className={`p-2 rounded-full transition-all ${
+                filterOpen ? 'bg-white/20 text-white' : 'bg-white/5 text-gray-400 hover:text-white'
+              }`}
             >
               {filterOpen ? <X size={18} /> : <Filter size={18} />}
             </button>
           </div>
         </div>
 
-        {/* --- FILTER DROPDOWN --- */}
+        {/* FILTER */}
         <AnimatePresence>
           {filterOpen && (
-            <motion.div 
+            <motion.div
               initial={{ height: 0, opacity: 0 }}
               animate={{ height: 'auto', opacity: 1 }}
               exit={{ height: 0, opacity: 0 }}
@@ -145,8 +173,13 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
                 ].map((f) => (
                   <button
                     key={f.id}
-                    onClick={() => { setActiveFilter(f.id as any); setFilterOpen(false); }}
-                    className={`p-3 rounded-xl flex items-center justify-between text-sm font-bold transition-all ${activeFilter === f.id ? f.color + ' text-white shadow-lg' : 'bg-white/5 text-gray-400 hover:bg-white/10'}`}
+                    onClick={() => {
+                      setActiveFilter(f.id as any);
+                      setFilterOpen(false);
+                    }}
+                    className={`p-3 rounded-xl flex items-center justify-between text-sm font-bold transition-all ${
+                      activeFilter === f.id ? f.color + ' text-white shadow-lg' : 'bg-white/5 text-gray-400 hover:bg-white/10'
+                    }`}
                   >
                     <span>{f.label}</span>
                     {activeFilter === f.id && <Check size={14} />}
@@ -157,11 +190,11 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
           )}
         </AnimatePresence>
 
-        {/* --- SEARCH BAR --- */}
+        {/* SEARCH */}
         <div className="px-3 py-2 border-b border-white/5">
           <div className="relative group">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 group-focus-within:text-violet-400 transition-colors" size={14} />
-            <input 
+            <input
               type="text"
               placeholder="Search symbol..."
               value={searchQuery}
@@ -169,35 +202,53 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
               className="w-full bg-black/20 border border-white/10 rounded-lg pl-9 pr-3 py-2 text-xs text-white placeholder:text-gray-600 focus:outline-none focus:border-violet-500/50 transition-all uppercase font-mono"
             />
             {searchQuery && (
-              <button 
-                onClick={() => setSearchQuery('')}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white"
-              >
+              <button onClick={() => setSearchQuery('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white">
                 <X size={12} />
               </button>
             )}
           </div>
         </div>
 
-        {/* --- COIN LIST --- */}
+        {/* LIST */}
         <div className={`flex-1 overflow-y-auto ${isMobile ? 'p-3' : 'p-2'} space-y-2 custom-scrollbar relative`}>
           <AnimatePresence mode="popLayout" initial={false}>
             {sorted.map((c, index) => {
-                const isAI = c.tag === 'AI';
-                const detectedAt = c.detectedAt || (c as any).addedAt || Date.now();
-                const activeMs = Math.max(0, now - detectedAt);
+              const isAI = c.tag === 'AI';
+              const detectedAt = c.detectedAt || Date.now();
+              const activeMs = Math.max(0, now - detectedAt);
 
-              let badge = null;
-              if (c.status === 'WON') {
-                badge = <span className="bg-green-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#16a34a] font-bold flex items-center gap-1"><CheckCircle size={10}/> WIN</span>;
-              } else if (c.status === 'LOST') {
-                badge = <span className="bg-red-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#dc2626] font-bold flex items-center gap-1"><XCircle size={10}/> LOSS</span>;
+              let badge: React.ReactNode = null;
+
+              if (String(c.status).toUpperCase() === 'WON') {
+                badge = (
+                  <span className="bg-green-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#16a34a] font-bold flex items-center gap-1">
+                    <CheckCircle size={10} /> WIN
+                  </span>
+                );
+              } else if (String(c.status).toUpperCase() === 'LOST') {
+                badge = (
+                  <span className="bg-red-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#dc2626] font-bold flex items-center gap-1">
+                    <XCircle size={10} /> LOSS
+                  </span>
+                );
               } else if (isAI) {
-                badge = <span className="bg-violet-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#7c3aed] font-bold">AI SNIPER</span>;
+                badge = (
+                  <span className="bg-violet-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#7c3aed] font-bold">
+                    AI SNIPER
+                  </span>
+                );
               } else if (c.signal === 'LONG') {
-                badge = <span className="bg-green-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#16a34a] font-bold">LONG ZONE</span>;
+                badge = (
+                  <span className="bg-green-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#16a34a] font-bold">
+                    LONG ZONE
+                  </span>
+                );
               } else if (c.signal === 'SHORT') {
-                badge = <span className="bg-red-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#dc2626] font-bold">SHORT ZONE</span>;
+                badge = (
+                  <span className="bg-red-600 text-white text-[10px] px-2 py-0.5 rounded shadow-[0_0_10px_#dc2626] font-bold">
+                    SHORT ZONE
+                  </span>
+                );
               } else {
                 badge = <span className="bg-orange-500/20 text-orange-300 text-[10px] px-2 py-0.5 rounded font-bold">VOLATILE</span>;
               }
@@ -218,7 +269,11 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
                   className={`
                     relative transition-colors cursor-pointer overflow-hidden group 
                     ${isMobile ? 'py-4 px-3' : 'p-3 rounded-xl border'} 
-                    ${isSelected ? 'bg-white/10 border-violet-500/50 shadow-[0_0_15px_rgba(139,92,246,0.2)]' : 'bg-white/5 border-white/5 hover:bg-white/10 hover:border-white/20'} 
+                    ${
+                      isSelected
+                        ? 'bg-white/10 border-violet-500/50 shadow-[0_0_15px_rgba(139,92,246,0.2)]'
+                        : 'bg-white/5 border-white/5 hover:bg-white/10 hover:border-white/20'
+                    } 
                     ${isLocked ? 'blur-md opacity-50 pointer-events-none select-none grayscale' : ''}
                   `}
                 >
@@ -236,6 +291,7 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
                         </span>
                       </div>
                     </div>
+
                     <div className="flex flex-col items-end">
                       {isAI ? (
                         <>
@@ -252,6 +308,7 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
                       )}
                     </div>
                   </div>
+
                   {isAI && !c.status && (
                     <div className="absolute bottom-0 left-0 w-full h-[3px] bg-gray-700/20">
                       <div className="h-full bg-gradient-to-r from-violet-600 to-cyan-500 animate-pulse" style={{ width: '100%' }} />
@@ -262,31 +319,30 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
             })}
           </AnimatePresence>
 
-          {/* LOCKED OVERLAY */}
           {!isPremium && sorted.length > 2 && (
             <div className="absolute bottom-0 left-0 w-full h-2/3 bg-gradient-to-t from-black via-black/80 to-transparent flex flex-col items-center justify-end pb-10 z-50 pointer-events-auto">
-            <div className="bg-white/10 backdrop-blur-xl border border-white/20 p-4 rounded-2xl shadow-2xl flex flex-col items-center gap-3 w-3/4">
-              <div className="w-10 h-10 bg-violet-600 rounded-full flex items-center justify-center shadow-[0_0_15px_#7c3aed] animate-pulse">
-                <Lock size={20} className="text-white" />
+              <div className="bg-white/10 backdrop-blur-xl border border-white/20 p-4 rounded-2xl shadow-2xl flex flex-col items-center gap-3 w-3/4">
+                <div className="w-10 h-10 bg-violet-600 rounded-full flex items-center justify-center shadow-[0_0_15px_#7c3aed] animate-pulse">
+                  <Lock size={20} className="text-white" />
+                </div>
+                <div className="text-center">
+                  <h3 className="text-white font-bold text-sm">PRO ACCESS LOCKED</h3>
+                  <p className="text-gray-400 text-[10px] mt-1">Unlock AI Signals & Full List</p>
+                </div>
+                <button
+                  onClick={() => {
+                    const tg = (window as any).Telegram?.WebApp;
+                    if (tg) {
+                      try { tg.sendData('buy_pro'); tg.close(); } catch (_) { try { tg.close(); } catch {} }
+                    } else {
+                      window.open('https://t.me/VortexAIScannerBot', '_blank');
+                    }
+                  }}
+                  className="w-full py-2 bg-gradient-to-r from-violet-600 to-indigo-600 rounded-lg text-xs font-bold text-white shadow-lg hover:scale-105 transition-transform"
+                >
+                  UNLOCK FOR 1000₽
+                </button>
               </div>
-              <div className="text-center">
-                <h3 className="text-white font-bold text-sm">PRO ACCESS LOCKED</h3>
-                <p className="text-gray-400 text-[10px] mt-1">Unlock AI Signals & Full List</p>
-              </div>
-              <button 
-                onClick={() => {
-                  const tg = (window as any).Telegram?.WebApp;
-                  if (tg) {
-                     try { tg.sendData("buy_pro"); tg.close(); } catch (e) { try { tg.close(); } catch(_){} }
-                  } else {
-                     window.open('https://t.me/VortexAIScannerBot', '_blank');
-                  }
-                }}
-                className="w-full py-2 bg-gradient-to-r from-violet-600 to-indigo-600 rounded-lg text-xs font-bold text-white shadow-lg hover:scale-105 transition-transform"
-              >
-                UNLOCK FOR 1000₽
-              </button>
-            </div>
             </div>
           )}
 
@@ -298,28 +354,28 @@ const Sidebar: React.FC<Props> = ({ onSelect, selected }) => {
           )}
         </div>
 
-        {/* --- FOOTER: NEXT SCAN TIMER --- */}
+        {/* FOOTER TIMER */}
         <div className="p-3 bg-black/60 border-t border-white/10 text-center relative overflow-hidden">
           {isScanning ? (
             <div className="text-yellow-400 text-xs font-bold animate-pulse flex justify-center items-center gap-2 relative z-10">
-              SCANNING NEW SIGNALS...
+              SCANNING...
             </div>
           ) : (
             <div className="text-xs font-mono text-gray-400 flex justify-between items-center px-2 relative z-10">
-              <span>Next Updates:</span>
+              <span>Next FT update:</span>
               <span className="text-cyan-400 font-bold text-sm">{fmtMMSS(timeToNextScan)}</span>
             </div>
           )}
+
           {!isScanning && (
-             <div className="absolute bottom-0 left-0 h-1 bg-cyan-600/50 w-full">
-               <div 
-                 className="h-full bg-cyan-400 shadow-[0_0_10px_#22d3ee]" 
-                 style={{ width: `${scanProgress}%`, transition: 'width 1s linear' }} 
-               />
-             </div>
+            <div className="absolute bottom-0 left-0 h-1 bg-cyan-600/30 w-full">
+              <div
+                className="h-full bg-cyan-400 shadow-[0_0_10px_#22d3ee]"
+                style={{ width: `${scanProgress}%`, transition: 'width 1s linear' }}
+              />
+            </div>
           )}
         </div>
-
       </div>
     </aside>
   );
