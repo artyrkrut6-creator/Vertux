@@ -1,4 +1,5 @@
 ﻿require('dotenv').config({ path: require('path').join(__dirname, '.env') });
+
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
@@ -15,6 +16,7 @@ app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '2mb' }));
 
 const DATA_FILE = path.join(__dirname, 'last_scheduled_prediction.json');
+
 const PROXY_URL = process.env.PROXY_URL || null;
 let agent = null;
 if (PROXY_URL) {
@@ -24,61 +26,81 @@ if (PROXY_URL) {
 // --- CONSTANTS ---
 const MIN_PRICE_FT = 0.02;
 const MIN_PRICE_AI = 0.10;
+
 const MIN_QUOTEVOL_FT = 700_000;
 const MIN_QUOTEVOL_AI = 1_500_000;
-const CHUNK_SIZE = 20; 
-const UI_INTERVAL = 300_000; 
+
+const CHUNK_SIZE = 20;
+
+const UI_INTERVAL = 300_000;
 const PRE_WORK_TIME = 45_000;
+
 const FT_INTERVAL = 60_000;
 const AI_INTERVAL = 600_000;
+
+const SIGNAL_AUTO_REMOVE_MS = 3000;
+
 const SILICON_KEY = process.env.SILICON_KEY || null;
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || null;
 const WEBAPP_URL = process.env.WEBAPP_URL || 'https://vortex-ai-nffc.onrender.com';
+
 const MONGO_URI = process.env.MONGO_URI || null;
-const MANAGER_USERNAME = 'meanfive1'; 
+const MANAGER_USERNAME = 'meanfive1';
 const ADMIN_ID = 8270078362;
-const CHANNEL_USERNAME = '@VortexAiOff'; 
+const CHANNEL_USERNAME = '@VortexAiOff';
 
 // --- STATE ---
 let scanInFlight = false;
 let nextFtScan = 0;
 let nextAiScan = 0;
-const activeSignals = new Map();
+
+const activeSignals = new Map(); // persistent AI
 let lastFtPicks = [];
+
 const sseClients = new Set();
 const pendingVerifications = new Map();
 
 // --- HELPERS ---
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+function safeNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
 async function mexcFetchJSON(url) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), 10000);
   try {
-    const res = agent ? await fetch(url, { agent, signal: controller.signal }) : await fetch(url, { signal: controller.signal });
+    const res = agent
+      ? await fetch(url, { agent, signal: controller.signal })
+      : await fetch(url, { signal: controller.signal });
     clearTimeout(id);
     if (!res.ok) return null;
     return res.json();
   } catch (e) { return null; }
 }
 
-async function fetch24hrTickers() { 
-    return mexcFetchJSON('https://api.mexc.com/api/v3/ticker/24hr'); 
+async function fetch24hrTickers() {
+  return mexcFetchJSON('https://api.mexc.com/api/v3/ticker/24hr');
 }
 
-async function fetchMexcKlines(symbol, interval='1m', limit=50) {
+async function fetchMexcKlines(symbol, interval = '1m', limit = 50) {
   const url = `https://api.mexc.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
   const data = await mexcFetchJSON(url);
   return Array.isArray(data) ? data : [];
 }
 
-async function fetchMexcDepth(symbol, limit=20) {
+async function fetchMexcDepth(symbol, limit = 20) {
   const url = `https://api.mexc.com/api/v3/depth?symbol=${encodeURIComponent(symbol)}&limit=${limit}`;
   return mexcFetchJSON(url);
 }
 
-function sseBroadcast(evt, data) { 
-    sseClients.forEach(c => c.write(`event: ${evt}\ndata: ${JSON.stringify(data)}\n\n`)); 
+function sseBroadcast(evt, data) {
+  const payload = `event: ${evt}\ndata: ${JSON.stringify(data)}\n\n`;
+  sseClients.forEach(c => {
+    try { c.write(payload); } catch (_) {}
+  });
 }
 
 function isSaneUsdtSymbol(sym) { return /^[A-Z0-9]{2,}USDT$/.test(sym); }
@@ -88,12 +110,12 @@ function isTokenizedStock(sym) { return /ONUSDT$/.test(sym); }
 
 function relStdDevPct(closes) {
   if (!closes.length) return 999;
-  const mean = closes.reduce((s,v)=>s+v,0)/closes.length;
+  const mean = closes.reduce((s, v) => s + v, 0) / closes.length;
   if (!mean) return 999;
   return (Math.sqrt(closes.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / closes.length) / mean) * 100;
 }
 
-function calculateRSI(closes, period=14) {
+function calculateRSI(closes, period = 14) {
   if (closes.length < period + 1) return 50;
   let gains = 0, losses = 0;
   for (let i = 1; i <= period; i++) {
@@ -114,76 +136,253 @@ function calculateRSI(closes, period=14) {
 // --- STAGE 1: SELECTION ---
 async function deepseekSelectWinner(candidates) {
   if (!SILICON_KEY) return null;
-  
+
   const system = `You are a Senior Quant Trader.
-Analyze 10 assets. Pick the SINGLE BEST opportunity for a 5-20 min scalp.
+Analyze assets. Pick the SINGLE BEST opportunity for a 5-20 min scalp.
 Criteria: Market Structure, Volume Anomalies, RSI Divergence.
 OUTPUT: Just the Ticker Symbol of the winner (e.g. "BTCUSDT").`;
 
   let userMsg = "Analyze these assets:\n";
   candidates.forEach((c, i) => {
-      const candlesStr = c.klines.slice(-10).map(k => `[O:${k[1]} H:${k[2]} L:${k[3]} C:${k[4]} V:${k[5]}]`).join(' ');
-      userMsg += `Asset ${i+1}: ${c.symbol}. RSI: ${c.rsi.toFixed(1)}. Candles: ${candlesStr}\n\n`;
+    const candlesStr = c.klines.slice(-10).map(k => {
+      const openTime = new Date(Number(k[0])).toISOString();
+      const closeTime = new Date(Number(k[6] || (Number(k[0]) + 60000))).toISOString();
+      return `{openTime:"${openTime}",closeTime:"${closeTime}",o:${k[1]},h:${k[2]},l:${k[3]},c:${k[4]},v:${k[5]}}`;
+    }).join(' ');
+    userMsg += `Asset ${i + 1}: ${c.symbol}. RSI: ${c.rsi.toFixed(1)}. Candles: ${candlesStr}\n\n`;
   });
   userMsg += "Which one is the winner? Return ONLY the symbol.";
 
   try {
     const r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
-        method: 'POST', headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'deepseek-ai/DeepSeek-V3', messages: [{ role: 'system', content: system }, { role: 'user', content: userMsg }], temperature: 0.1 }),
+      method: 'POST',
+      headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-ai/DeepSeek-V3',
+        messages: [{ role: 'system', content: system }, { role: 'user', content: userMsg }],
+        temperature: 0.1
+      }),
     });
     if (!r.ok) return null;
     const j = await r.json();
-    const content = j?.choices?.[0]?.message?.content || '';
-    const winner = candidates.find(c => content.includes(c.symbol));
+    const content = String(j?.choices?.[0]?.message?.content || '').toUpperCase();
+    const winner = candidates.find(c => content.includes(String(c.symbol).toUpperCase()));
     return winner || null;
   } catch (e) { return null; }
 }
 
 // --- STAGE 2: EXECUTION ---
+function stripJsonFences(s) {
+  if (!s) return '';
+  let out = String(s).trim();
+  if (out.includes('```')) {
+    const parts = out.split('```');
+    let best = out;
+    for (const p of parts) {
+      const t = p.trim();
+      if (t.startsWith('{') && t.endsWith('}')) best = t;
+    }
+    out = best;
+  }
+  return out.trim();
+}
+
+function validateAiOutput(obj, lastClose) {
+  const tp = safeNum(obj?.target_price);
+  const sl = safeNum(obj?.stop_loss_price);
+  const dir = String(obj?.direction || '').toUpperCase();
+  const conf = safeNum(obj?.confidence);
+
+  if (!tp || !sl) return null;
+  if (dir !== 'LONG' && dir !== 'SHORT') return null;
+
+  // sanity: не слишком далеко
+  const tpMove = Math.abs(tp / lastClose - 1);
+  const slMove = Math.abs(sl / lastClose - 1);
+  if (tpMove > 0.10 || slMove > 0.10) return null;
+
+  if (dir === 'LONG') {
+    if (!(tp > lastClose && sl < lastClose)) return null;
+  } else {
+    if (!(tp < lastClose && sl > lastClose)) return null;
+  }
+
+  return {
+    target_price: tp,
+    stop_loss_price: sl,
+    direction: dir,
+    confidence: Math.max(0, Math.min(100, conf ?? 70)),
+    forecast_1m: Array.isArray(obj?.forecast_1m) ? obj.forecast_1m : []
+  };
+}
+
 async function deepseekExecution(winner) {
   if (!SILICON_KEY) return null;
 
   const klines = await fetchMexcKlines(winner.symbol, '1m', 50);
   const depth = await fetchMexcDepth(winner.symbol, 20);
-  
-  const candlesStr = klines.slice(-50).map(k => `[T:${new Date(k[0]).toTimeString().slice(0,5)} O:${k[1]} H:${k[2]} L:${k[3]} C:${k[4]} V:${k[5]}]`).join('\n');
 
-  const system = `You are Vortex AI. Output JSON: { "target_price": number, "stop_loss_price": number, "direction": "LONG"|"SHORT", "confidence": 0-100, "forecast_1m": [ ...5 candles... ] }`;
-  const user = `Final Analysis for ${winner.symbol}. Price: ${winner.price}. RSI: ${winner.rsi.toFixed(1)}.
-OrderBook Bids: ${depth?.bids?.[0]?.[0]}. Asks: ${depth?.asks?.[0]?.[0]}.
-Last 50 Candles:
+  if (!klines || klines.length < 20) return null;
+
+  const candlesStr = klines.slice(-20).map(k => {
+    const openTime = new Date(Number(k[0])).toISOString();
+    const closeTime = new Date(Number(k[6] || (Number(k[0]) + 60000))).toISOString();
+    return `{openTime:"${openTime}",closeTime:"${closeTime}",o:${k[1]},h:${k[2]},l:${k[3]},c:${k[4]},v:${k[5]}}`;
+  }).join('\n');
+
+  const lastClose = Number(klines[klines.length - 1][4]);
+
+  const system = `You are Vortex AI. Return ONLY valid JSON.
+Schema: {"target_price":number,"stop_loss_price":number,"direction":"LONG"|"SHORT","confidence":0-100,"forecast_1m":[{"close":number}]}
+Rules:
+- trade must resolve within 5-20 minutes
+- keep tp/sl within 1%..3% from lastClose if possible
+- LONG => tp > lastClose and sl < lastClose
+- SHORT => tp < lastClose and sl > lastClose
+- forecast_1m must be exactly 5 items moving smoothly toward target
+No markdown.`;
+
+  const user = `Final analysis for ${winner.symbol}.
+lastClose: ${lastClose}
+winnerPrice: ${winner.price}
+winnerRSI: ${winner.rsi.toFixed(1)}
+orderBookTop: ${JSON.stringify({ bids: depth?.bids?.slice(0, 5) || [], asks: depth?.asks?.slice(0, 5) || [] })}
+candles_1m_last20:
 ${candlesStr}
-Predict NOW.`;
+Return JSON now.`;
 
   const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), 25000); 
+  const id = setTimeout(() => controller.abort(), 25000);
 
   try {
-    console.log(`🤖 AI Executing: ${winner.symbol}`);
     const r = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
-        method: 'POST', headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'deepseek-ai/DeepSeek-V3', messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0.1, response_format: { type: 'json_object' } }),
-        signal: controller.signal
+      method: 'POST',
+      headers: { Authorization: `Bearer ${SILICON_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-ai/DeepSeek-V3',
+        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+        temperature: 0.1,
+        response_format: { type: 'json_object' }
+      }),
+      signal: controller.signal
     });
+
     clearTimeout(id);
     if (!r.ok) return null;
+
     const j = await r.json();
     let content = j?.choices?.[0]?.message?.content || '{}';
-    if (content.includes('```json')) content = content.split('```json')[1].split('```')[0].trim();
-    const parsed = JSON.parse(content);
-    if (!parsed.target_price) return null;
+    content = stripJsonFences(content);
+
+    let parsed = null;
+    try { parsed = JSON.parse(content); } catch (_) { parsed = null; }
+
+    const v = validateAiOutput(parsed, lastClose);
+    if (!v) return null;
 
     const now = Date.now();
+    const candles = [];
+    const path = v.forecast_1m.slice(0, 5);
+    for (let i = 0; i < 5; i++) {
+      const c = safeNum(path?.[i]?.close);
+      const fallbackClose = lastClose + (v.target_price - lastClose) * ((i + 1) / 5);
+      candles.push({ t: now + (i + 1) * 60000, close: c ?? fallbackClose });
+    }
+
     return {
-        candles: parsed.forecast_1m.map((c, i) => ({ t: now + (i+1)*60000, close: Number(c.close) })),
-        target_price: Number(parsed.target_price),
-        stop_loss_price: Number(parsed.stop_loss_price),
-        direction: parsed.direction,
-        confidence: Number(parsed.confidence),
-        source: 'deepseek'
+      candles,
+      target_price: Number(v.target_price),
+      stop_loss_price: Number(v.stop_loss_price),
+      direction: v.direction,
+      confidence: Number(v.confidence),
+      source: 'deepseek'
     };
-  } catch (e) { return null; }
+  } catch (e) {
+    clearTimeout(id);
+    return null;
+  }
+}
+
+// --- PERSIST ---
+function buildPayload() {
+  const finalDetected = [...Array.from(activeSignals.values()), ...lastFtPicks];
+
+  const forecasts = {};
+  activeSignals.forEach(s => {
+    forecasts[s.symbol] = {
+      generatedAt: s.addedAt,
+      horizonMinutes: 5,
+      candles: s.forecastCandles,
+      target_price: s.target_price,
+      stop_loss_price: s.stop_loss_price,
+      direction: s.direction,
+      status: s.status,
+      source: s.source || 'deepseek',
+      confidence: s.confidence ?? 0,
+      removeAt: s.removeAt || null
+    };
+  });
+
+  return {
+    ts: new Date().toISOString(),
+    nextScanAt: nextFtScan,
+    nextFtScan,
+    nextAiScan,
+    parsed: { detected: finalDetected, forecastsBySymbol: forecasts }
+  };
+}
+
+function persistAndBroadcast(payload) {
+  try { fs.writeFileSync(DATA_FILE, JSON.stringify(payload)); } catch (_) {}
+  sseBroadcast('scheduled_update', payload);
+}
+
+function cleanupExpiredSignals() {
+  const now = Date.now();
+  for (const [sym, sig] of activeSignals.entries()) {
+    if (sig?.removeAt && now >= sig.removeAt) activeSignals.delete(sym);
+  }
+}
+
+function updateSignalStatus(sig, price) {
+  if (!sig || sig.status !== 'ACTIVE') return false;
+
+  let done = false;
+  if (sig.direction === 'LONG') {
+    if (price >= sig.target_price) { sig.status = 'WON'; done = true; }
+    else if (price <= sig.stop_loss_price) { sig.status = 'LOST'; done = true; }
+  } else {
+    if (price <= sig.target_price) { sig.status = 'WON'; done = true; }
+    else if (price >= sig.stop_loss_price) { sig.status = 'LOST'; done = true; }
+  }
+
+  if (done) sig.removeAt = Date.now() + SIGNAL_AUTO_REMOVE_MS;
+  return done;
+}
+
+function loadPersistedSignals() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return;
+    const latest = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    const detected = latest?.parsed?.detected || [];
+    const forecasts = latest?.parsed?.forecastsBySymbol || {};
+    detected.forEach(d => {
+      if (d?.tag === 'AI' && d?.symbol) {
+        const f = forecasts[d.symbol];
+        activeSignals.set(d.symbol, {
+          ...d,
+          target_price: f?.target_price ?? d.target_price,
+          stop_loss_price: f?.stop_loss_price ?? d.stop_loss_price,
+          direction: f?.direction ?? d.direction,
+          status: f?.status ?? d.status,
+          forecastCandles: f?.candles ?? d.forecastCandles ?? [],
+          addedAt: f?.generatedAt ?? d.addedAt ?? Date.now(),
+          confidence: f?.confidence ?? d.confidence ?? 0,
+          removeAt: f?.removeAt ?? d.removeAt ?? null
+        });
+      }
+    });
+  } catch (_) {}
 }
 
 // --- SCANNER JOB ---
@@ -196,434 +395,538 @@ async function runScannerJob() {
     const all = await fetch24hrTickers();
     if (!all) throw new Error("MEXC API Fail");
 
-    const base = all.map(x => ({ symbol: x.symbol, quoteVolume: Number(x.quoteVolume), lastPrice: Number(x.lastPrice), priceChangePercent: Number(x.priceChangePercent) }))
-        .filter(x => x.symbol.endsWith('USDT') && isSaneUsdtSymbol(x.symbol) && !isStablecoinLike(x.symbol) && !isLeveraged(x.symbol));
+    const base = all
+      .map(x => ({
+        symbol: x.symbol,
+        quoteVolume: Number(x.quoteVolume),
+        lastPrice: Number(x.lastPrice),
+        priceChangePercent: Number(x.priceChangePercent)
+      }))
+      .filter(x =>
+        x.symbol.endsWith('USDT') &&
+        isSaneUsdtSymbol(x.symbol) &&
+        !isStablecoinLike(x.symbol) &&
+        !isLeveraged(x.symbol) &&
+        !isTokenizedStock(x.symbol)
+      );
 
     const baseMap = new Map(base.map(b => [b.symbol, b]));
-    const symbolsToRemove = [];
 
-    // 1. Check Active Signals
-    for (const [sym, sig] of Array.from(activeSignals.entries())) {
-        const tick = baseMap.get(sym);
-        if (!tick) continue;
-        const price = Number(tick.lastPrice);
-        let done = false;
-        if (sig.direction === 'LONG') {
-            if (price >= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+30000; done = true; }
-            else if (price <= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+30000; done = true; }
-        } else {
-            if (price <= sig.target_price) { sig.status = 'WON'; sig.removeAt = Date.now()+30000; done = true; }
-            else if (price >= sig.stop_loss_price) { sig.status = 'LOST'; sig.removeAt = Date.now()+30000; done = true; }
-        }
-        if (done) symbolsToRemove.push(sym); else sig.price = price;
+    // 1) Update active signals, do NOT delete immediately
+    for (const [sym, sig] of activeSignals.entries()) {
+      const tick = baseMap.get(sym);
+      if (!tick) continue;
+      const price = Number(tick.lastPrice);
+      sig.price = price;
+      if (sig.status === 'ACTIVE') updateSignalStatus(sig, price);
     }
-    symbolsToRemove.forEach(sym => activeSignals.delete(sym));
+    cleanupExpiredSignals();
 
     const now = Date.now();
 
-    // 2. AI SCAN (Every 10 mins) - TWO STAGE
+    // 2) AI SCAN
     if (now >= nextAiScan && activeSignals.size < 5) {
-        console.log('🧠 Running AI Selection...');
-        nextAiScan = now + AI_INTERVAL;
-        
-        // Stage 1: Get Top 10 Candidates
-        const candidates = base
-            .filter(x => x.symbol.endsWith('USDT') && !['BTCUSDT','ETHUSDT'].includes(x.symbol) && Number(x.quoteVolume) > 1000000)
-            .sort((a,b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent))
-            .slice(0, 10);
+      console.log('🧠 Running AI Selection...');
+      nextAiScan = now + AI_INTERVAL;
 
-        const enriched = [];
-        for (const c of candidates) {
-            const kl = await fetchMexcKlines(c.symbol, '1m', 15);
-            if (kl.length < 15) continue;
-            const closes = kl.map(k=>Number(k[4]));
-            enriched.push({ symbol: c.symbol, price: Number(c.lastPrice), quoteVolume: Number(c.quoteVolume), rsi: calculateRSI(closes), klines: kl });
-        }
+      const candidates = base
+        .filter(x => x.symbol.endsWith('USDT') && !['BTCUSDT','ETHUSDT'].includes(x.symbol) && Number(x.quoteVolume) > 1000000)
+        .sort((a, b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent))
+        .slice(0, 5);
 
-        if (enriched.length > 0) {
-            console.log('🤖 Selector analyzing...');
-            const winner = await deepseekSelectWinner(enriched);
-            
-            if (winner) {
-                console.log('🏆 Winner Chosen:', winner.symbol);
-                // Stage 2: Execution
-                const signal = await deepseekExecution(winner);
-                if (signal) {
-                    activeSignals.set(winner.symbol, {
-                        symbol: winner.symbol, tag: 'AI', price: winner.price,
-                        target_price: signal.target_price, stop_loss_price: signal.stop_loss_price, direction: signal.direction,
-                        forecastCandles: signal.candles, detectedAt: Date.now(), status: 'ACTIVE',
-                        addedAt: Date.now(), stdDev: 0, quoteVolume: winner.quoteVolume, change24hPct: 0
-                    });
-                }
-            }
+      const enriched = [];
+      for (const c of candidates) {
+        const kl = await fetchMexcKlines(c.symbol, '1m', 15);
+        if (kl.length < 15) continue;
+        const closes = kl.map(k => Number(k[4]));
+        enriched.push({ symbol: c.symbol, price: Number(c.lastPrice), quoteVolume: Number(c.quoteVolume), rsi: calculateRSI(closes), klines: kl });
+      }
+
+      if (enriched.length > 0) {
+        console.log('🤖 Selector analyzing...');
+        const winner = await deepseekSelectWinner(enriched);
+
+        if (winner) {
+          console.log('🏆 Winner Chosen:', winner.symbol);
+          const signal = await deepseekExecution(winner);
+
+          if (signal) {
+            activeSignals.set(winner.symbol, {
+              symbol: winner.symbol,
+              tag: 'AI',
+              price: winner.price,
+              target_price: signal.target_price,
+              stop_loss_price: signal.stop_loss_price,
+              direction: String(signal.direction || '').toUpperCase(),
+              confidence: signal.confidence ?? 0,
+              forecastCandles: signal.candles || [],
+              detectedAt: Date.now(),
+              status: 'ACTIVE',
+              addedAt: Date.now(),
+              stdDev: 0,
+              quoteVolume: winner.quoteVolume,
+              change24hPct: 0,
+              source: signal.source || 'deepseek'
+            });
+          }
         }
+      }
     }
 
-    // 3. FT SCAN (Every 1 min)
+    // 3) FT SCAN
     if (now >= nextFtScan) {
-        nextFtScan = now + FT_INTERVAL;
-        const ftPool = base.filter(x => !activeSignals.has(x.symbol) && x.quoteVolume >= MIN_QUOTEVOL_FT).sort((a,b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent)).slice(0, 60);
-        const ftPicks = [];
-        for (let i=0; i<ftPool.length; i+=CHUNK_SIZE) {
-            const chunk = ftPool.slice(i, i+CHUNK_SIZE);
-            await Promise.all(chunk.map(async (t) => {
-                const k = await fetchMexcKlines(t.symbol, '1m', 20);
-                if(k.length < 15) return;
-                const rsi = calculateRSI(k.map(x=>Number(x[4])), 14);
-                let signal = 'NEUTRAL'; if (rsi < 35) signal = 'LONG'; if (rsi > 65) signal = 'SHORT';
-                ftPicks.push({ ...t, rsi, signal, tag: 'FT', stdDev: relStdDevPct(k.map(x=>Number(x[4]))) });
-            }));
-        }
-        const longs = ftPicks.filter(f => f.signal === 'LONG').slice(0,7);
-        const shorts = ftPicks.filter(f => f.signal === 'SHORT').slice(0,7);
-        const vols = ftPicks.filter(f => f.signal === 'NEUTRAL').slice(0,6);
-        lastFtPicks = [...longs, ...shorts, ...vols];
-        console.log(`⚡ FT Scan Done: ${lastFtPicks.length} picks`);
+      nextFtScan = now + FT_INTERVAL;
+
+      const ftPool = base
+        .filter(x => !activeSignals.has(x.symbol) && x.quoteVolume >= MIN_QUOTEVOL_FT)
+        .sort((a, b) => Math.abs(b.priceChangePercent) - Math.abs(a.priceChangePercent))
+        .slice(0, 60);
+
+      const ftPicks = [];
+      for (let i = 0; i < ftPool.length; i += CHUNK_SIZE) {
+        const chunk = ftPool.slice(i, i + CHUNK_SIZE);
+        await Promise.all(chunk.map(async (t) => {
+          const k = await fetchMexcKlines(t.symbol, '1m', 20);
+          if (k.length < 15) return;
+
+          const closes = k.map(x => Number(x[4]));
+          const rsi = calculateRSI(closes, 14);
+
+          let signal = 'NEUTRAL';
+          if (rsi < 35) signal = 'LONG';
+          if (rsi > 65) signal = 'SHORT';
+
+          ftPicks.push({
+            symbol: t.symbol,
+            quoteVolume: t.quoteVolume,
+            lastPrice: t.lastPrice,
+            priceChangePercent: t.priceChangePercent,
+            rsi,
+            signal,
+            tag: 'FT',
+            stdDev: relStdDevPct(closes),
+            detectedAt: Date.now(),
+            expiresAt: Date.now() + 600000
+          });
+        }));
+      }
+
+      const longs = ftPicks.filter(f => f.signal === 'LONG').slice(0, 7);
+      const shorts = ftPicks.filter(f => f.signal === 'SHORT').slice(0, 7);
+      const vols = ftPicks.filter(f => f.signal === 'NEUTRAL').slice(0, 6);
+      lastFtPicks = [...longs, ...shorts, ...vols];
+      console.log(`⚡ FT Scan Done: ${lastFtPicks.length} picks`);
     }
 
-    const finalDetected = [...Array.from(activeSignals.values()), ...lastFtPicks];
-    const forecasts = {};
-    activeSignals.forEach(s => {
-        forecasts[s.symbol] = {
-            generatedAt: s.addedAt, horizonMinutes: 5, candles: s.forecastCandles,
-            target_price: s.target_price, stop_loss_price: s.stop_loss_price, direction: s.direction, status: s.status, source: 'deepseek'
-        };
-    });
-
+    const payload = buildPayload();
     console.log(`✅ Update: AI=${activeSignals.size}`);
+    persistAndBroadcast(payload);
 
-    const payload = { ts: new Date().toISOString(), nextScanAt: nextFtScan, nextAiScan: nextAiScan, parsed: { detected: finalDetected, forecastsBySymbol: forecasts } };
-    fs.writeFileSync(DATA_FILE, JSON.stringify(payload));
-    sseBroadcast('scheduled_update', payload);
-
-  } catch (e) { console.error(e); } 
-  finally { scanInFlight = false; setTimeout(runScannerJob, 30000); }
+  } catch (e) {
+    console.error(e);
+  } finally {
+    scanInFlight = false;
+    setTimeout(runScannerJob, 30000);
+  }
 }
 
 // --- DB & USER ---
 if (MONGO_URI) {
-  mongoose.connect(MONGO_URI).then(()=>console.log('[DB] Connected')).catch(e=>console.error('[DB] Error', e));
+  mongoose.connect(MONGO_URI).then(() => console.log('[DB] Connected')).catch(e => console.error('[DB] Error', e));
 }
-const UserSchema = new mongoose.Schema({ 
-    tgId: { type: String, unique: true }, 
-    isPremium: Boolean, 
-    expiresAt: Number, 
-    language: { type: String, default: 'en' },
-    notificationsEnabled: { type: Boolean, default: true },
-    firstName: String, 
-    username: String 
+
+const UserSchema = new mongoose.Schema({
+  tgId: { type: String, unique: true },
+  isPremium: Boolean,
+  expiresAt: Number,
+  language: { type: String, default: 'en' },
+  notificationsEnabled: { type: Boolean, default: true },
+  firstName: String,
+  username: String
 });
+
 const User = mongoose.models.User || mongoose.model('User', UserSchema);
 
 async function activateUser(id) {
-  try { await User.findOneAndUpdate({ tgId: String(id) }, { isPremium: true, expiresAt: Date.now() + 30*24*3600000 }, { upsert: true }); } catch(e){}
+  try {
+    await User.findOneAndUpdate(
+      { tgId: String(id) },
+      { isPremium: true, expiresAt: Date.now() + 30 * 24 * 3600000 },
+      { upsert: true }
+    );
+  } catch (e) {}
 }
+
 async function checkUser(id) {
-  try { const u = await User.findOne({ tgId: String(id) }); return u && u.isPremium && u.expiresAt > Date.now(); } catch(e){ return false; }
+  try {
+    const u = await User.findOne({ tgId: String(id) });
+    return u && u.isPremium && u.expiresAt > Date.now();
+  } catch (e) {
+    return false;
+  }
 }
 
 let notifyProUsers = async (message) => { console.log('[notifyProUsers] noop', message); };
 
+// --- TEXTS (as you had) ---
 const TEXTS = {
-    ru: {
-        welcome: "👋 Добро пожаловать в Vortex AI!\n\nПожалуйста, подпишитесь на наш канал, чтобы продолжить.",
-        sub_check: "🔄 Проверить подписку",
-        sub_error: "❌ Вы не подписаны на канал.",
-        lang_select: "🌐 Выберите язык / Select Language:",
-        menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Рынок", settings: "⚙️ Настройки", help: "❓ Помощь" },
-        market: "🔄 Сканирую рынок...",
-        premium_status: "✅ Ваш статус: PRO",
-        premium_buy: "💎 **VORTEX PRO**\n\n• AI Снайпер Сигналы\n• Без задержек\n• Полный доступ\n\n**Цена:** 1000 RUB / 1 Месяц",
-        pay_methods: { crypto: "💠 Крипта (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Карта РФ" },
-        disclaimer: "⚠️ **ЮРИДИЧЕСКИЙ ДИСКЛЕЙМЕР**\n\nТорговля — риск. Возврата нет.",
-        agree_pay: "✅ Согласен, Оплатить",
-        manual_pay: "💳 **Способ оплаты: Перевод на карту** 🇷🇺\n💰 **К оплате:** 1000 RUB\n\n👋 Напиши менеджеру по кнопке ниже, он выдаст реквизиты.\n\n🍇 **ПОСЛЕ ПЕРЕВОДА** — возвращайся сюда и жми кнопку **\"✅ Я Оплатил\"**. Затем отправляй скриншот.\n\n_Доступ выдаётся в течение 5 минут._",
-        btn_manager: "📩 Написать Менеджеру",
-        btn_paid: "✅ Я Оплатил",
-        btn_back: "🔙 Назад",
-        settings: "⚙️ **Настройки**",
-        alerts: "🔔 Уведомления AI:",
-        lang_btn: "🌐 Сменить Язык",
-        profile: "👤 **ПРОФИЛЬ**",
-        no_sub: "❌ Нет подписки",
-        days_left: "дней",
-        buy_btn: "💎 Купить Premium",
-        help: "📚 **ПОМОЩЬ**\n\n• **AI Signals:** Снайперские входы от DeepSeek.\n• **FT:** Зоны перекупленности.\n\nSupport: @meanfive1",
-        app_desc: "📱 **Vortex Web App**\n\nНажмите кнопку ниже, чтобы запустить:"
-    },
-    en: {
-        welcome: "👋 Welcome to Vortex AI!\n\nPlease subscribe to our channel to continue.",
-        sub_check: "🔄 Check Subscription",
-        sub_error: "❌ You are not subscribed.",
-        lang_select: "🌐 Select Language:",
-        menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Market", settings: "⚙️ Settings", help: "❓ Help" },
-        app_desc: "📱 **Vortex Web App**\n\nClick below to launch:",
-        market: "🔄 Scanning...",
-        premium_status: "✅ Your Status: PRO",
-        premium_buy: "💎 **VORTEX PRO**\n\n• AI Sniper Signals\n• Zero Latency\n• Full Access\n\n**Price:** $10 / 1 Month",
-        pay_methods: { crypto: "💠 Crypto (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Bank Card" },
-        disclaimer: "⚠️ **LEGAL DISCLAIMER**\n\nTrading involves risk. No refunds.",
-        agree_pay: "✅ I Agree & Pay",
-        manual_pay: "💳 **Payment Method: Bank Card**\n💰 **Price:** $10\n\n👋 Contact manager below.\n\n🍇 **AFTER PAYMENT** — come back and click **\"✅ I Paid\"**. Then send a screenshot.\n\n_Access granted within 5 mins._",
-        btn_manager: "📩 Contact Manager",
-        btn_paid: "✅ I Paid",
-        btn_back: "🔙 Back",
-        settings: "⚙️ **Settings**",
-        alerts: "🔔 AI Alerts:",
-        lang_btn: "🌐 Change Language",
-        profile: "👤 **PROFILE**",
-        no_sub: "❌ No Subscription",
-        days_left: "days",
-        buy_btn: "💎 Buy Premium",
-        help: "📚 **HELP**\n\n• **AI Signals:** Sniper entries by DeepSeek.\n• **FT:** RSI Oversold/Overbought zones.\n\nSupport: @meanfive1"
-    }
+  ru: {
+    welcome: "👋 Добро пожаловать в Vortex AI!\n\nПожалуйста, подпишитесь на наш канал, чтобы продолжить.",
+    sub_check: "🔄 Проверить подписку",
+    sub_error: "❌ Вы не подписаны на канал.",
+    lang_select: "🌐 Выберите язык / Select Language:",
+    menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Рынок", settings: "⚙️ Настройки", help: "❓ Помощь" },
+    market: "🔄 Сканирую рынок...",
+    premium_status: "✅ Ваш статус: PRO",
+    premium_buy: "💎 **VORTEX PRO**\n\n• AI Снайпер Сигналы\n• Без задержек\n• Полный доступ\n\n**Цена:** 1000 RUB / 1 Месяц",
+    pay_methods: { crypto: "💠 Крипта (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Карта РФ" },
+    disclaimer: "⚠️ **ЮРИДИЧЕСКИЙ ДИСКЛЕЙМЕР**\n\nТорговля — риск. Возврата нет.",
+    agree_pay: "✅ Согласен, Оплатить",
+    manual_pay: "💳 **Способ оплаты: Перевод на карту** 🇷🇺\n💰 **К оплате:** 1000 RUB\n\n👋 Напиши менеджеру по кнопке ниже, он выдаст реквизиты.\n\n🍇 **ПОСЛЕ ПЕРЕВОДА** — возвращайся сюда и жми кнопку **\"✅ Я Оплатил\"**. Затем отправляй скриншот.\n\n_Доступ выдаётся в течение 5 минут._",
+    btn_manager: "📩 Написать Менеджеру",
+    btn_paid: "✅ Я Оплатил",
+    btn_back: "🔙 Назад",
+    settings: "⚙️ **Настройки**",
+    alerts: "🔔 Уведомления AI:",
+    lang_btn: "🌐 Сменить Язык",
+    profile: "👤 **ПРОФИЛЬ**",
+    no_sub: "❌ Нет подписки",
+    days_left: "дней",
+    buy_btn: "💎 Купить Premium",
+    help: "📚 **ПОМОЩЬ**\n\n• **AI Signals:** Снайперские входы от DeepSeek.\n• **FT:** Зоны перекупленности.\n\nSupport: @meanfive1",
+    app_desc: "📱 **Vortex Web App**\n\nНажмите кнопку ниже, чтобы запустить:"
+  },
+  en: {
+    welcome: "👋 Welcome to Vortex AI!\n\nPlease subscribe to our channel to continue.",
+    sub_check: "🔄 Check Subscription",
+    sub_error: "❌ You are not subscribed.",
+    lang_select: "🌐 Select Language:",
+    menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Market", settings: "⚙️ Settings", help: "❓ Help" },
+    app_desc: "📱 **Vortex Web App**\n\nClick below to launch:",
+    market: "🔄 Scanning...",
+    premium_status: "✅ Your Status: PRO",
+    premium_buy: "💎 **VORTEX PRO**\n\n• AI Sniper Signals\n• Zero Latency\n• Full Access\n\n**Price:** $10 / 1 Month",
+    pay_methods: { crypto: "💠 Crypto (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Bank Card" },
+    disclaimer: "⚠️ **LEGAL DISCLAIMER**\n\nTrading involves risk. No refunds.",
+    agree_pay: "✅ I Agree & Pay",
+    manual_pay: "💳 **Payment Method: Bank Card**\n💰 **Price:** $10\n\n👋 Contact manager below.\n\n🍇 **AFTER PAYMENT** — come back and click **\"✅ I Paid\"**. Then send a screenshot.\n\n_Access granted within 5 mins._",
+    btn_manager: "📩 Contact Manager",
+    btn_paid: "✅ I Paid",
+    btn_back: "🔙 Back",
+    settings: "⚙️ **Settings**",
+    alerts: "🔔 AI Alerts:",
+    lang_btn: "🌐 Change Language",
+    profile: "👤 **PROFILE**",
+    no_sub: "❌ No Subscription",
+    days_left: "days",
+    buy_btn: "💎 Buy Premium",
+    help: "📚 **HELP**\n\n• **AI Signals:** Sniper entries by DeepSeek.\n• **FT:** RSI Oversold/Overbought zones.\n\nSupport: @meanfive1"
+  }
 };
 
-// --- TELEGRAM BOT ---
+// --- TELEGRAM BOT (your original, kept) ---
 if (TG_BOT_TOKEN) {
-    try {
-        const bot = new Telegraf(TG_BOT_TOKEN);
+  try {
+    const bot = new Telegraf(TG_BOT_TOKEN);
 
-        const getMenu = (lang) => {
-            const T = TEXTS[lang] || TEXTS['ru'];
-            return Markup.keyboard([
-                [T.menu.app, T.menu.premium], 
-                [T.menu.market, T.menu.settings], 
-                [T.menu.help]
-            ]).resize();
-        };
+    const getMenu = (lang) => {
+      const T = TEXTS[lang] || TEXTS['ru'];
+      return Markup.keyboard([[T.menu.app, T.menu.premium], [T.menu.market, T.menu.settings], [T.menu.help]]).resize();
+    };
 
-        const getT = async (ctx) => {
-            const u = await User.findOne({ tgId: String(ctx.from.id) });
-            return TEXTS[u?.language || 'ru'] || TEXTS['ru'];
-        };
+    const getT = async (ctx) => {
+      const u = await User.findOne({ tgId: String(ctx.from.id) });
+      return TEXTS[u?.language || 'ru'] || TEXTS['ru'];
+    };
 
-        bot.use(async (ctx, next) => {
-            if (ctx.from) {
-                try {
-                    await User.findOneAndUpdate(
-                        { tgId: String(ctx.from.id) },
-                        { firstName: ctx.from.first_name, username: ctx.from.username },
-                        { upsert: true }
-                    );
-                } catch(e){}
-            }
-            if (ctx.message && ctx.message.text && !ctx.message.text.startsWith('/')) {
-                try {
-                    const member = await bot.telegram.getChatMember(CHANNEL_USERNAME, ctx.from.id);
-                    if (['left', 'kicked'].includes(member.status)) {
-                        const T = await getT(ctx);
-                        return ctx.reply(T.sub_error, Markup.inlineKeyboard([
-                            Markup.button.url('📢 Channel', `https://t.me/${CHANNEL_USERNAME.replace('@','')}`),
-                            Markup.button.callback(T.sub_check, 'check_sub')
-                        ]));
-                    }
-                } catch (e) { /* ignore */ }
-            }
-            return next();
-        });
-
-        notifyProUsers = async (message) => {
-          try {
-            const users = await User.find({ isPremium: true, notificationsEnabled: true }).lean().exec();
-            for (const u of users) { try { await bot.telegram.sendMessage(u.tgId, message); } catch (e) {} }
-          } catch (e) { console.warn('Notify Error:', e); }
-        };
-
-        bot.command('start', async (ctx) => {
-            await ctx.reply('🌐 Choose language / Выберите язык', Markup.inlineKeyboard([
-                Markup.button.callback('🇷🇺 Русский', 'lang_ru'),
-                Markup.button.callback('🇺🇸 English', 'lang_en')
-            ]));
-        });
-
-        bot.command('admin', async (ctx) => {
-            if (String(ctx.from.id) !== String(ADMIN_ID)) return; 
-            const count = await User.countDocuments();
-            const pros = await User.countDocuments({ isPremium: true });
-            ctx.reply(`👑 **ADMIN**\nTotal: ${count}\nPRO: ${pros}\n\n/give <id>\n/del <id>`);
-        });
-
-        bot.command('give', async (ctx) => {
-            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
-            const id = ctx.message.text.split(' ')[1];
-            if (id) { 
-                await activateUser(id); 
-                ctx.reply(`✅ Given PRO to ${id}`);
-                try { await bot.telegram.sendMessage(id, '🎉 **Admin granted you Premium!** Restart app.'); } catch(e){}
-            } else {
-                ctx.reply('Usage: /give 12345678');
-            }
-        });
-
-        bot.command('del', async (ctx) => {
-            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
-            const id = ctx.message.text.split(' ')[1];
-            if (id) { 
-                await User.findOneAndUpdate({ tgId: String(id) }, { isPremium: false });
-                ctx.reply(`❌ Removed PRO from ${id}`); 
-            }
-        });
-
-        bot.command('force', async (ctx) => {
-            if (String(ctx.from.id) !== String(ADMIN_ID)) return;
-            const sym = (ctx.message.text.split(' ')[1] || 'DOGEUSDT').toUpperCase();
-            
-            const k = await fetchMexcKlines(sym, '1m', 50);
-            if (!k.length) return ctx.reply('Symbol not found');
-            const price = Number(k[k.length-1][4]);
-            
-            // Mock Signal
-            const signal = {
-                symbol: sym, tag: 'AI', price,
-                target_price: price * 1.002, stop_loss_price: price * 0.998, direction: 'LONG',
-                forecastCandles: [], detectedAt: Date.now(), status: 'ACTIVE', addedAt: Date.now(),
-                stdDev: 0, quoteVolume: 1000000, spreadPct: 0.01, source: 'deepseek'
-            };
-            
-            activeSignals.set(sym, signal);
-            ctx.reply(`✅ Forced ${sym}`);
-        });
-
-        bot.action(/^lang_(.+)$/, async (ctx) => {
-            const lang = ctx.match[1];
-            await User.findOneAndUpdate({ tgId: String(ctx.from.id) }, { language: lang }, { upsert: true });
-            await ctx.answerCbQuery();
-            try { await ctx.deleteMessage(); } catch(e){}
-            const T = TEXTS[lang] || TEXTS['ru'];
-            await ctx.reply(T.welcome, getMenu(lang));
-        });
-
-        bot.action('check_sub', (ctx) => { ctx.deleteMessage(); ctx.reply('✅ OK!'); });
-
-        bot.hears([/🚀 Vortex App/, /🚀 Открыть Терминал/, /App/, /Terminal/], async (ctx) => {
+    bot.use(async (ctx, next) => {
+      if (ctx.from) {
+        try {
+          await User.findOneAndUpdate(
+            { tgId: String(ctx.from.id) },
+            { firstName: ctx.from.first_name, username: ctx.from.username },
+            { upsert: true }
+          );
+        } catch (e) {}
+      }
+      if (ctx.message && ctx.message.text && !ctx.message.text.startsWith('/')) {
+        try {
+          const member = await bot.telegram.getChatMember(CHANNEL_USERNAME, ctx.from.id);
+          if (['left', 'kicked'].includes(member.status)) {
             const T = await getT(ctx);
-            ctx.reply(T.app_desc, { parse_mode: 'HTML', ...Markup.inlineKeyboard([Markup.button.webApp(T.menu.app, WEBAPP_URL)]) });
+            return ctx.reply(
+              T.sub_error,
+              Markup.inlineKeyboard([
+                Markup.button.url('📢 Channel', `https://t.me/${CHANNEL_USERNAME.replace('@', '')}`),
+                Markup.button.callback(T.sub_check, 'check_sub')
+              ])
+            );
+          }
+        } catch (e) {}
+      }
+      return next();
+    });
+
+    notifyProUsers = async (message) => {
+      try {
+        const users = await User.find({ isPremium: true, notificationsEnabled: true }).lean().exec();
+        for (const u of users) {
+          try { await bot.telegram.sendMessage(u.tgId, message); } catch (e) {}
+        }
+      } catch (e) { console.warn('Notify Error:', e); }
+    };
+
+    bot.command('start', async (ctx) => {
+      await ctx.reply('🌐 Choose language / Выберите язык', Markup.inlineKeyboard([
+        Markup.button.callback('🇷🇺 Русский', 'lang_ru'),
+        Markup.button.callback('🇺🇸 English', 'lang_en')
+      ]));
+    });
+
+    bot.command('admin', async (ctx) => {
+      if (String(ctx.from.id) !== String(ADMIN_ID)) return;
+      const count = await User.countDocuments();
+      const pros = await User.countDocuments({ isPremium: true });
+      ctx.reply(`👑 **ADMIN**\nTotal: ${count}\nPRO: ${pros}\n\n/give <id>\n/del <id>`);
+    });
+
+    bot.command('give', async (ctx) => {
+      if (String(ctx.from.id) !== String(ADMIN_ID)) return;
+      const id = ctx.message.text.split(' ')[1];
+      if (id) {
+        await activateUser(id);
+        ctx.reply(`✅ Given PRO to ${id}`);
+        try { await bot.telegram.sendMessage(id, '🎉 Admin granted you Premium! Restart app.'); } catch (e) {}
+      } else {
+        ctx.reply('Usage: /give 12345678');
+      }
+    });
+
+    bot.command('del', async (ctx) => {
+      if (String(ctx.from.id) !== String(ADMIN_ID)) return;
+      const id = ctx.message.text.split(' ')[1];
+      if (id) {
+        await User.findOneAndUpdate({ tgId: String(id) }, { isPremium: false });
+        ctx.reply(`❌ Removed PRO from ${id}`);
+      }
+    });
+
+    bot.command('force', async (ctx) => {
+      if (String(ctx.from.id) !== String(ADMIN_ID)) return;
+      const sym = (ctx.message.text.split(' ')[1] || 'DOGEUSDT').toUpperCase();
+
+      const k = await fetchMexcKlines(sym, '1m', 50);
+      if (!k.length) return ctx.reply('Symbol not found');
+      const price = Number(k[k.length - 1][4]);
+
+      const signal = {
+        symbol: sym, tag: 'AI', price,
+        target_price: price * 1.002, stop_loss_price: price * 0.998, direction: 'LONG',
+        forecastCandles: [], detectedAt: Date.now(), status: 'ACTIVE', addedAt: Date.now(),
+        stdDev: 0, quoteVolume: 1000000, spreadPct: 0.01, source: 'deepseek'
+      };
+
+      activeSignals.set(sym, signal);
+      ctx.reply(`✅ Forced ${sym}`);
+    });
+
+    bot.action(/^lang_(.+)$/, async (ctx) => {
+      const lang = ctx.match[1];
+      await User.findOneAndUpdate({ tgId: String(ctx.from.id) }, { language: lang }, { upsert: true });
+      await ctx.answerCbQuery();
+      try { await ctx.deleteMessage(); } catch (e) {}
+      const T = TEXTS[lang] || TEXTS['ru'];
+      await ctx.reply(T.welcome, getMenu(lang));
+    });
+
+    bot.action('check_sub', (ctx) => { ctx.deleteMessage(); ctx.reply('✅ OK!'); });
+
+    bot.hears([/🚀 Vortex App/, /🚀 Открыть Терминал/, /App/, /Terminal/], async (ctx) => {
+      const T = await getT(ctx);
+      ctx.reply(T.app_desc, { parse_mode: 'HTML', ...Markup.inlineKeyboard([Markup.button.webApp(T.menu.app, WEBAPP_URL)]) });
+    });
+
+    bot.hears([/👤 Профиль/, /👤 Profile/], async (ctx) => {
+      const T = await getT(ctx);
+      const u = await User.findOne({ tgId: String(ctx.from.id) });
+      const isPro = u && u.isPremium && u.expiresAt > Date.now();
+      let statusText = T.no_sub;
+      if (isPro) {
+        const days = Math.ceil((u.expiresAt - Date.now()) / (1000 * 60 * 60 * 24));
+        statusText = `PRO (${days} ${T.days_left})`;
+      }
+      ctx.reply(`${T.profile}\n\n🆔 ID: <code>${ctx.from.id}</code>\n👤 User: @${ctx.from.username}\n💎 Status: ${statusText}`, { parse_mode: 'HTML' });
+    });
+
+    bot.hears([/⚙️ Настройки/, /⚙️ Settings/], async (ctx) => {
+      const T = await getT(ctx);
+      const u = await User.findOne({ tgId: String(ctx.from.id) });
+      const s = u?.notificationsEnabled ? '✅ ON' : '❌ OFF';
+      ctx.reply(`${T.settings}\n\n${T.alerts} ${s}`, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback(T.lang_btn, 'change_lang')],
+          [Markup.button.callback('Toggle Alerts', 'toggle_alerts')]
+        ])
+      });
+    });
+
+    bot.action('change_lang', (ctx) => {
+      ctx.reply('🌐 Choose language:', Markup.inlineKeyboard([
+        Markup.button.callback('🇷🇺 Русский', 'lang_ru'),
+        Markup.button.callback('🇺🇸 English', 'lang_en')
+      ]));
+    });
+
+    bot.action('toggle_alerts', async (ctx) => {
+      const u = await User.findOne({ tgId: String(ctx.from.id) });
+      if (!u?.isPremium) return ctx.answerCbQuery('PRO Only');
+      u.notificationsEnabled = !u.notificationsEnabled;
+      await u.save();
+      ctx.answerCbQuery(u.notificationsEnabled ? 'On' : 'Off');
+    });
+
+    bot.hears([/💎 Premium/, /💎 Премиум/], async (ctx) => {
+      const T = await getT(ctx);
+      const u = await checkUser(ctx.from.id);
+      if (u) return ctx.reply('✅ You are PRO.');
+      await ctx.reply(T.disclaimer, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback(T.agree_pay, 'show_pay')]]) });
+    });
+
+    bot.action('show_pay', async (ctx) => {
+      const T = await getT(ctx);
+      ctx.editMessageText(T.premium_buy, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback(T.pay_methods.card, 'pay_manager')],
+          [Markup.button.callback(T.pay_methods.crypto, 'pay_manager')],
+          [Markup.button.callback(T.pay_methods.stars, 'pay_stars')]
+        ])
+      });
+    });
+
+    bot.action('pay_manager', async (ctx) => {
+      const T = await getT(ctx);
+      const msg = T.language === 'en' ? 'Hello, I want to buy Premium.' : 'Привет, нужны реквизиты для оплаты переводом на карту.';
+      const link = `https://t.me/${MANAGER_USERNAME}?text=${encodeURIComponent(msg)}`;
+      ctx.editMessageText(T.manual_pay, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+          [Markup.button.url(T.btn_manager, link)],
+          [Markup.button.callback(T.btn_paid, 'paid_manual')],
+          [Markup.button.callback(T.btn_back, 'show_pay')]
+        ])
+      });
+    });
+
+    bot.action('paid_manual', async (ctx) => {
+      const T = await getT(ctx);
+      await ctx.answerCbQuery();
+      await ctx.reply(T.language === 'en' ? '📸 Please send a screenshot.' : '📸 Пожалуйста, отправьте скриншот оплаты.');
+      pendingVerifications.set(ctx.from.id, true);
+    });
+
+    bot.on('photo', async (ctx) => {
+      if (pendingVerifications.get(ctx.from.id)) {
+        pendingVerifications.delete(ctx.from.id);
+        await ctx.reply('⏳ Verifying...');
+        await bot.telegram.sendPhoto(ADMIN_ID, ctx.message.photo[ctx.message.photo.length - 1].file_id, {
+          caption: `💰 Payment from ${ctx.from.first_name} (ID: ${ctx.from.id})`,
+          ...Markup.inlineKeyboard([
+            Markup.button.callback('✅ Approve', `approve_${ctx.from.id}`),
+            Markup.button.callback('❌ Reject', `reject_${ctx.from.id}`)
+          ])
         });
+      }
+    });
 
-        bot.hears([/👤 Профиль/, /👤 Profile/], async (ctx) => {
-            const T = await getT(ctx);
-            const u = await User.findOne({ tgId: String(ctx.from.id) });
-            const isPro = u && u.isPremium && u.expiresAt > Date.now();
-            let statusText = T.no_sub;
-            if (isPro) {
-                const days = Math.ceil((u.expiresAt - Date.now()) / (1000 * 60 * 60 * 24));
-                statusText = `PRO (${days} ${T.days_left})`;
-            }
-            ctx.reply(`${T.profile}\n\n🆔 ID: <code>${ctx.from.id}</code>\n👤 User: @${ctx.from.username}\n💎 Status: ${statusText}`, { parse_mode: 'HTML' });
-        });
+    bot.action(/^approve_(\d+)$/, async (ctx) => {
+      const userId = ctx.match[1];
+      await activateUser(userId);
+      await bot.telegram.sendMessage(userId, '🎉 Premium Activated!');
+      ctx.editMessageCaption(ctx.callbackQuery.message.caption + '\n\n✅ APPROVED');
+    });
 
-        bot.hears([/⚙️ Настройки/, /⚙️ Settings/], async (ctx) => {
-            const T = await getT(ctx);
-            const u = await User.findOne({ tgId: String(ctx.from.id) });
-            const s = u?.notificationsEnabled ? '✅ ON' : '❌ OFF';
-            ctx.reply(`${T.settings}\n\n${T.alerts} ${s}`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([
-                [Markup.button.callback(T.lang_btn, 'change_lang')],
-                [Markup.button.callback('Toggle Alerts', 'toggle_alerts')]
-            ])});
-        });
+    bot.action(/^reject_(\d+)$/, async (ctx) => {
+      const userId = ctx.match[1];
+      await bot.telegram.sendMessage(userId, '❌ Payment Rejected.');
+      ctx.editMessageCaption(ctx.callbackQuery.message.caption + '\n\n❌ REJECTED');
+    });
 
-        bot.action('change_lang', (ctx) => {
-            ctx.reply('🌐 Choose language:', Markup.inlineKeyboard([
-                Markup.button.callback('🇷🇺 Русский', 'lang_ru'),
-                Markup.button.callback('🇺🇸 English', 'lang_en')
-            ]));
-        });
+    bot.action('pay_stars', (ctx) => ctx.replyWithInvoice({
+      chat_id: ctx.from.id,
+      title: 'Vortex PRO',
+      description: '1 Month',
+      payload: 'pro',
+      provider_token: '',
+      currency: 'XTR',
+      prices: [{ label: '1 Month', amount: 500 }]
+    }));
 
-        bot.action('toggle_alerts', async (ctx) => {
-            const u = await User.findOne({ tgId: String(ctx.from.id) });
-            if (!u?.isPremium) return ctx.answerCbQuery('PRO Only');
-            u.notificationsEnabled = !u.notificationsEnabled;
-            await u.save();
-            ctx.answerCbQuery(u.notificationsEnabled ? 'On' : 'Off');
-        });
+    bot.on('pre_checkout_query', (ctx) => ctx.answerPreCheckoutQuery(true));
+    bot.on('successful_payment', async (ctx) => { await activateUser(ctx.from.id); ctx.reply('🎉 Paid!'); });
 
-        bot.hears([/💎 Premium/, /💎 Премиум/], async (ctx) => {
-            const T = await getT(ctx);
-            const u = await checkUser(ctx.from.id);
-            if (u) return ctx.reply('✅ You are PRO.');
-            await ctx.reply(T.disclaimer, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback(T.agree_pay, 'show_pay')]]) });
-        });
+    bot.hears(/📊 Market|📊 Рынок/, async (ctx) => {
+      const T = await getT(ctx);
+      ctx.reply(T.market);
+    });
 
-        bot.action('show_pay', async (ctx) => {
-            const T = await getT(ctx);
-            ctx.editMessageText(T.premium_buy, { parse_mode: 'HTML', ...Markup.inlineKeyboard([
-                [Markup.button.callback(T.pay_methods.card, 'pay_manager')],
-                [Markup.button.callback(T.pay_methods.crypto, 'pay_manager')],
-                [Markup.button.callback(T.pay_methods.stars, 'pay_stars')]
-            ])});
-        });
+    bot.hears(/❓ Help|❓ Помощь/, async (ctx) => {
+      const T = await getT(ctx);
+      ctx.reply(T.help, { parse_mode: 'HTML' });
+    });
 
-        bot.action('pay_manager', async (ctx) => {
-            const T = await getT(ctx);
-            const msg = T.language === 'en' ? 'Hello, I want to buy Premium.' : 'Привет, нужны реквизиты для оплаты переводом на карту.';
-            const link = `https://t.me/${MANAGER_USERNAME}?text=${encodeURIComponent(msg)}`;
-            ctx.editMessageText(T.manual_pay, { parse_mode: 'HTML', ...Markup.inlineKeyboard([
-                [Markup.button.url(T.btn_manager, link)],
-                [Markup.button.callback(T.btn_paid, 'paid_manual')],
-                [Markup.button.callback(T.btn_back, 'show_pay')]
-            ])});
-        });
-
-        bot.action('paid_manual', async (ctx) => {
-            const T = await getT(ctx);
-            await ctx.answerCbQuery();
-            await ctx.reply(T.language === 'en' ? '📸 Please send a screenshot.' : '📸 Пожалуйста, отправьте скриншот оплаты.');
-            pendingVerifications.set(ctx.from.id, true);
-        });
-
-        bot.on('photo', async (ctx) => {
-            if (pendingVerifications.get(ctx.from.id)) {
-                pendingVerifications.delete(ctx.from.id);
-                await ctx.reply('⏳ Verifying...');
-                await bot.telegram.sendPhoto(ADMIN_ID, ctx.message.photo[ctx.message.photo.length - 1].file_id, {
-                    caption: `💰 Payment from ${ctx.from.first_name} (ID: ${ctx.from.id})`,
-                    ...Markup.inlineKeyboard([Markup.button.callback('✅ Approve', `approve_${ctx.from.id}`), Markup.button.callback('❌ Reject', `reject_${ctx.from.id}`)])
-                });
-            }
-        });
-
-        bot.action(/^approve_(\d+)$/, async (ctx) => {
-            const userId = ctx.match[1];
-            await activateUser(userId);
-            await bot.telegram.sendMessage(userId, '🎉 Premium Activated!');
-            ctx.editMessageCaption(ctx.callbackQuery.message.caption + '\n\n✅ APPROVED');
-        });
-
-        bot.action(/^reject_(\d+)$/, async (ctx) => {
-            const userId = ctx.match[1];
-            await bot.telegram.sendMessage(userId, '❌ Payment Rejected.');
-            ctx.editMessageCaption(ctx.callbackQuery.message.caption + '\n\n❌ REJECTED');
-        });
-
-        bot.action('pay_stars', (ctx) => ctx.replyWithInvoice({ chat_id: ctx.from.id, title: 'Vortex PRO', description: '1 Month', payload: 'pro', provider_token: '', currency: 'XTR', prices: [{ label: '1 Month', amount: 500 }] }));
-        bot.on('pre_checkout_query', (ctx) => ctx.answerPreCheckoutQuery(true));
-        bot.on('successful_payment', async (ctx) => { await activateUser(ctx.from.id); ctx.reply('🎉 Paid!'); });
-
-        bot.hears(/📊 Market|📊 Рынок/, async (ctx) => {
-            const T = await getT(ctx);
-            ctx.reply(T.market);
-        });
-
-        bot.hears(/❓ Help|❓ Помощь/, async (ctx) => {
-            const T = await getT(ctx);
-            ctx.reply(T.help, { parse_mode: 'HTML' });
-        });
-
-        bot.launch().then(() => console.log('🤖 Bot Started'));
-        
-        process.once('SIGINT', () => bot.stop('SIGINT'));
-        process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
-    } catch(e) { console.error('Bot Error:', e); }
+    bot.launch().then(() => console.log('🤖 Bot Started'));
+    process.once('SIGINT', () => bot.stop('SIGINT'));
+    process.once('SIGTERM', () => bot.stop('SIGTERM'));
+  } catch (e) {
+    console.error('Bot Error:', e);
+  }
 }
 
-// --- INIT ---
+// --- API ROUTES REQUIRED BY WEBAPP ---
+app.get('/api/user/status', async (req, res) => {
+  const id = req.query.tg_id;
+  const hasAccess = await checkUser(id);
+  res.json({ isPremium: hasAccess });
+});
+
+app.get('/api/scheduler/latest', (req, res) => {
+  try {
+    if (fs.existsSync(DATA_FILE)) return res.json(JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')));
+  } catch (_) {}
+  res.json({});
+});
+
+app.get('/events', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+  });
+
+  sseClients.add(res);
+
+  if (fs.existsSync(DATA_FILE)) {
+    res.write(`event: scheduled_update\ndata: ${fs.readFileSync(DATA_FILE, 'utf8')}\n\n`);
+  }
+
+  req.on('close', () => {
+    sseClients.delete(res);
+  });
+});
+
+// --- FRONTEND SERVE (keep last; do NOT eat /api and /events) ---
 app.use(express.static(path.join(__dirname, '../dist')));
-app.get('*', (req, res) => { if (!req.path.startsWith('/api')) res.sendFile(path.join(__dirname, '../dist/index.html')); });
-app.listen(PORT, () => { 
-    try { loadPersistedSignals(); } catch(e){} 
-    console.log(`🚀 Server on ${PORT}`); 
-    runScannerJob(); 
+app.get('*', (req, res) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/events')) return;
+  res.sendFile(path.join(__dirname, '../dist/index.html'));
+});
+
+// --- START ---
+app.listen(PORT, () => {
+  try { loadPersistedSignals(); } catch (e) {}
+  console.log(`🚀 Server on ${PORT}`);
+  runScannerJob();
 });
