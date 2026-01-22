@@ -9,6 +9,9 @@ const { BollingerBands } = require('technicalindicators');
 const mongoose = require('mongoose');
 const { Telegraf, Markup } = require('telegraf');
 
+process.on('unhandledRejection', (e) => console.error('[process] unhandledRejection', e));
+process.on('uncaughtException', (e) => console.error('[process] uncaughtException', e));
+
 const PORT = Number(process.env.PORT || 5176);
 const app = express();
 
@@ -33,15 +36,11 @@ const MIN_QUOTEVOL_AI = 1_000_000;
 const CHUNK_SIZE = 20;
 
 const FT_INTERVAL = 60_000;
-const AI_INTERVAL = 300_000; // 5 min
-const LOOP_INTERVAL = 30_000; // main loop tick
+const AI_INTERVAL = 300_000;
+const LOOP_INTERVAL = 30_000;
 
 const SIGNAL_AUTO_REMOVE_MS = 3000;
-
-// max active AI signals
-const AI_MAX_ACTIVE = 1;
-
-// cooldown after AI closes => prevent FT resurrection
+const AI_MAX_ACTIVE = 1; // максимум 1 активный AI сигнал
 const COOLDOWN_MS = 15 * 60_000;
 
 const SILICON_KEY = process.env.SILICON_KEY || null;
@@ -61,11 +60,10 @@ let scanInFlight = false;
 let nextFtScan = Date.now() + FT_INTERVAL;
 let nextAiScan = Date.now() + AI_INTERVAL;
 
-const activeSignals = new Map(); // persistent AI
+const activeSignals = new Map(); // persistent AI signals
 let lastFtPicks = []; // snapshot FT list
 
 const cooldowns = new Map(); // symbol -> cooldownUntil
-
 const sseClients = new Set();
 const pendingVerifications = new Map();
 
@@ -278,7 +276,7 @@ function buildTop5Candidates(enriched) {
   return scored.sort((a, b) => b.score - a.score).slice(0, 5);
 }
 
-// ------------------- STAGE 1: DeepSeek chooses winner from Top-5 -------------------
+// ------------------- STAGE 1: DeepSeek choose winner -------------------
 async function deepseekSelectWinner(top5) {
   if (!SILICON_KEY) return null;
 
@@ -289,18 +287,15 @@ async function deepseekSelectWinner(top5) {
 
   let userMsg = 'Assets:\n';
   top5.forEach((c, i) => {
-    const candles = c.klines15.slice(-10).map((k) => {
-      const openTime = new Date(Number(k[0])).toISOString();
-      const closeTime = new Date(Number(k[6] || (Number(k[0]) + 60_000))).toISOString();
-      return {
-        openTime, closeTime,
-        open: Number(k[1]),
-        high: Number(k[2]),
-        low: Number(k[3]),
-        close: Number(k[4]),
-        volume: Number(k[5]),
-      };
-    });
+    const candles = c.klines15.slice(-10).map((k) => ({
+      openTime: new Date(Number(k[0])).toISOString(),
+      closeTime: new Date(Number(k[6] || (Number(k[0]) + 60_000))).toISOString(),
+      open: Number(k[1]),
+      high: Number(k[2]),
+      low: Number(k[3]),
+      close: Number(k[4]),
+      volume: Number(k[5]),
+    }));
 
     userMsg += `#${i + 1} ${c.symbol}\n`;
     userMsg += `rsi=${c.rsi.toFixed(2)} score=${Number(c.score || 0).toFixed(3)}\n`;
@@ -327,12 +322,16 @@ async function deepseekSelectWinner(top5) {
   }
 }
 
-// ------------------- STAGE 2: DeepSeek execution (TP/SL) -------------------
+// ------------------- STAGE 2: DeepSeek execution -------------------
 async function deepseekExecution(winner) {
   if (!SILICON_KEY) return null;
 
   const klines = await fetchMexcKlines(winner.symbol, '1m', 50);
   if (!klines || klines.length < 20) return null;
+
+  const closes = klines.map((k) => Number(k[4]));
+  const lastClose = closes[closes.length - 1];
+  const rsi = calculateRSI(closes.slice(-40), 14);
 
   const candles20 = klines.slice(-20).map((k) => ({
     openTime: new Date(Number(k[0])).toISOString(),
@@ -343,10 +342,6 @@ async function deepseekExecution(winner) {
     close: Number(k[4]),
     volume: Number(k[5]),
   }));
-
-  const closes = klines.map((k) => Number(k[4]));
-  const lastClose = closes[closes.length - 1];
-  const rsi = calculateRSI(closes.slice(-40), 14);
 
   const depth = await fetchMexcDepth(winner.symbol, 20);
   const orderBook = {
@@ -426,6 +421,7 @@ function updateSignalStatus(sig, price) {
   if (!sig || sig.status !== 'ACTIVE') return false;
 
   let done = false;
+
   if (sig.direction === 'LONG') {
     if (price >= sig.target_price) { sig.status = 'WON'; done = true; }
     else if (price <= sig.stop_loss_price) { sig.status = 'LOST'; done = true; }
@@ -438,6 +434,7 @@ function updateSignalStatus(sig, price) {
     sig.removeAt = Date.now() + SIGNAL_AUTO_REMOVE_MS;
     putCooldown(sig.symbol);
   }
+
   return done;
 }
 
@@ -508,7 +505,7 @@ function loadPersistedSignals() {
       }
     });
 
-    // keep only one ACTIVE AI
+    // keep only 1 ACTIVE AI after restart
     const actives = Array.from(activeSignals.values())
       .filter((s) => s?.tag === 'AI' && String(s.status || '').toUpperCase() === 'ACTIVE')
       .sort((a, b) => Number(b.addedAt || b.detectedAt || 0) - Number(a.addedAt || a.detectedAt || 0));
@@ -563,7 +560,7 @@ async function runScannerJob() {
     cleanupExpiredSignals();
     cleanupCooldowns();
 
-    // AI scan every 5 minutes
+    // AI scan
     if (now >= nextAiScan) {
       nextAiScan = now + AI_INTERVAL;
 
@@ -593,6 +590,7 @@ async function runScannerJob() {
         }
 
         const top5 = buildTop5Candidates(enriched);
+
         if (top5.length) {
           const winner = await deepseekSelectWinner(top5);
           if (winner && countActiveAiActiveOnly() < AI_MAX_ACTIVE) {
@@ -606,13 +604,11 @@ async function runScannerJob() {
                 quoteVolume: winner.quoteVolume,
                 change24hPct: winner.priceChangePercent ?? 0,
                 stdDev: winner.stdDev ?? 0,
-
                 target_price: exec.target_price,
                 stop_loss_price: exec.stop_loss_price,
                 direction: exec.direction,
                 confidence: exec.confidence ?? 0,
                 forecastCandles: exec.candles || [],
-
                 detectedAt: Date.now(),
                 status: 'ACTIVE',
                 addedAt: Date.now(),
@@ -624,7 +620,7 @@ async function runScannerJob() {
       }
     }
 
-    // FT scan every 1 minute (snapshot, expiresAt = nextFtScan)
+    // FT scan
     if (now >= nextFtScan) {
       nextFtScan = now + FT_INTERVAL;
 
@@ -661,7 +657,7 @@ async function runScannerJob() {
               signal,
               stdDev: relStdDevPct(closes),
               detectedAt: Date.now(),
-              expiresAt: nextFtScan,
+              expiresAt: nextFtScan, // FIX: no 1000h
             });
           })
         );
@@ -727,21 +723,30 @@ async function getUserLang(tgId) {
   }
 }
 
-// ------------------- TEXTS (FULL AS YOU WANTED) -------------------
+async function notifyProUsers(message, bot) {
+  try {
+    const users = await User.find({ isPremium: true, notificationsEnabled: true }).lean().exec();
+    for (const u of users) {
+      try { await bot.telegram.sendMessage(u.tgId, message); } catch (_) {}
+    }
+  } catch (_) {}
+}
+
+// ------------------- TEXTS (FULL) -------------------
 const TEXTS = {
   ru: {
     welcome: "👋 Добро пожаловать в Vortex AI!\n\nПожалуйста, подпишитесь на наш канал, чтобы продолжить.",
     sub_check: "🔄 Проверить подписку",
     sub_error: "❌ Вы не подписаны на канал.",
     lang_select: "🌐 Выберите язык / Select Language:",
-    menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Рынок", settings: "⚙️ Настройки", help: "❓ Помощь" },
+    menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Рынок", settings: "⚙️ Настройки", help: "❓ Помощь", profile: "👤 Профиль" },
     market: "🔄 Сканирую рынок...",
     premium_status: "✅ Ваш статус: PRO",
     premium_buy: "💎 **VORTEX PRO**\n\n• AI Снайпер Сигналы\n• Без задержек\n• Полный доступ\n\n**Цена:** 1000 RUB / 1 Месяц",
     pay_methods: { crypto: "💠 Крипта (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Карта РФ" },
     disclaimer: "⚠️ **ЮРИДИЧЕСКИЙ ДИСКЛЕЙМЕР**\n\nТорговля — риск. Возврата нет.",
     agree_pay: "✅ Согласен, Оплатить",
-    manual_pay: "💳 **Способ оплаты: Перевод на карту** 🇷🇺\n💰 **К оплате:** 1000 RUB\n\n👋 Напиши менеджеру по кнопке ниже, он выдаст реквизиты.\n\nПОСЛЕ ПЕРЕВОДА — возвращайся сюда и жми кнопку \"✅ Я Оплатил\". Затем отправляй скриншот.\n\nДоступ выдаётся в течение 5 минут.",
+    manual_pay: "💳 **Способ оплаты: Перевод на карту** 🇷🇺\n💰 **К оплате:** 1000 RUB\n\n👋 Напиши менеджеру по кнопке ниже, он выдаст реквизиты.\n\nПОСЛЕ ПЕРЕВОДА — возвращайся сюда и жми кнопку **\"✅ Я Оплатил\"**. Затем отправляй скриншот.\n\n_Доступ выдаётся в течение 5 минут._",
     btn_manager: "📩 Написать Менеджеру",
     btn_paid: "✅ Я Оплатил",
     btn_back: "🔙 Назад",
@@ -751,16 +756,15 @@ const TEXTS = {
     profile: "👤 **ПРОФИЛЬ**",
     no_sub: "❌ Нет подписки",
     days_left: "дней",
-    buy_btn: "💎 Купить Premium",
-    help: "📚 **ПОМОЩЬ**\n\n• AI Signals: входы от DeepSeek.\n• FT: RSI зоны.\n\nSupport: @meanfive1",
-    app_desc: "📱 **Vortex Web App**\n\nНажмите кнопку ниже, чтобы запустить:",
+    help: "📚 **ПОМОЩЬ**\n\n• **AI Signals:** входы от DeepSeek.\n• **FT:** RSI зоны.\n\nSupport: @meanfive1",
+    app_desc: "📱 **Vortex Web App**\n\nНажмите кнопку ниже, чтобы запустить:"
   },
   en: {
     welcome: "👋 Welcome to Vortex AI!\n\nPlease subscribe to our channel to continue.",
     sub_check: "🔄 Check Subscription",
     sub_error: "❌ You are not subscribed.",
     lang_select: "🌐 Select Language:",
-    menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Market", settings: "⚙️ Settings", help: "❓ Help" },
+    menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Market", settings: "⚙️ Settings", help: "❓ Help", profile: "👤 Profile" },
     app_desc: "📱 **Vortex Web App**\n\nClick below to launch:",
     market: "🔄 Scanning...",
     premium_status: "✅ Your Status: PRO",
@@ -768,7 +772,7 @@ const TEXTS = {
     pay_methods: { crypto: "💠 Crypto (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Bank Card" },
     disclaimer: "⚠️ **LEGAL DISCLAIMER**\n\nTrading involves risk. No refunds.",
     agree_pay: "✅ I Agree & Pay",
-    manual_pay: "💳 **Payment Method: Bank Card**\n💰 **Price:** $10\n\nContact manager below.\n\nAFTER PAYMENT — come back and click \"✅ I Paid\". Then send a screenshot.\n\nAccess granted within 5 mins.",
+    manual_pay: "💳 **Payment Method: Bank Card**\n💰 **Price:** $10\n\nContact manager below.\n\nAFTER PAYMENT — come back and click **\"✅ I Paid\"**. Then send a screenshot.\n\n_Access granted within 5 mins._",
     btn_manager: "📩 Contact Manager",
     btn_paid: "✅ I Paid",
     btn_back: "🔙 Back",
@@ -778,8 +782,7 @@ const TEXTS = {
     profile: "👤 **PROFILE**",
     no_sub: "❌ No Subscription",
     days_left: "days",
-    buy_btn: "💎 Buy Premium",
-    help: "📚 **HELP**\n\n• AI Signals: DeepSeek entries.\n• FT: RSI zones.\n\nSupport: @meanfive1",
+    help: "📚 **HELP**\n\n• **AI Signals:** DeepSeek entries.\n• **FT:** RSI zones.\n\nSupport: @meanfive1"
   }
 };
 
@@ -789,9 +792,7 @@ async function isSubscribed(bot, userId) {
     const member = await bot.telegram.getChatMember(CHANNEL_USERNAME, userId);
     return !['left', 'kicked'].includes(member.status);
   } catch (e) {
-    // Если бот не админ канала или канал приватный — будет ошибка.
-    // Тут лучше НЕ блокировать навсегда: но ты хочешь жестко — ставь false.
-    console.warn('[bot] getChatMember error:', e?.message || e);
+    // важно: чтобы это работало, бот должен быть админом канала
     return false;
   }
 }
@@ -800,10 +801,9 @@ if (TG_BOT_TOKEN) {
   (async () => {
     try {
       const bot = new Telegraf(TG_BOT_TOKEN);
-
       bot.catch((err) => console.error('[bot] runtime error:', err));
 
-      // IMPORTANT: polling mode, clear webhook
+      // polling mode (старый код работал так)
       try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch (_) {}
 
       const getMenu = (lang) => {
@@ -829,42 +829,42 @@ if (TG_BOT_TOKEN) {
       const sendAppEntry = async (ctx, lang) => {
         const T = TEXTS[lang] || TEXTS.ru;
         return ctx.reply(
-          T.app_desc || 'Open app:',
+          T.app_desc || 'Open:',
           { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.webApp(T.menu.app, WEBAPP_URL)]]) }
         );
       };
 
-      // start => language choice
+      // Start => language select
       bot.command('start', async (ctx) => {
-        await ctx.reply('🌐 Choose language / Выберите язык', Markup.inlineKeyboard([
+        await ctx.reply(TEXTS.ru.lang_select, Markup.inlineKeyboard([
           Markup.button.callback('🇷🇺 Русский', 'lang_ru'),
           Markup.button.callback('🇺🇸 English', 'lang_en')
         ]));
       });
 
-      // language set => CHECK SUB, if not subscribed => show channel button
+      // after language select => check subscription, if not subscribed => show channel button
       bot.action(/^lang_(.+)$/, async (ctx) => {
         const lang = ctx.match[1] === 'en' ? 'en' : 'ru';
-        try { await User.findOneAndUpdate({ tgId: String(ctx.from.id) }, { language: lang }, { upsert: true }); } catch (_) {}
         await ctx.answerCbQuery();
         try { await ctx.deleteMessage(); } catch (_) {}
+
+        try { await User.findOneAndUpdate({ tgId: String(ctx.from.id) }, { language: lang }, { upsert: true }); } catch (_) {}
 
         const ok = await isSubscribed(bot, ctx.from.id);
         if (!ok) return sendSubscribeGate(ctx, lang);
 
-        const T = TEXTS[lang] || TEXTS.ru;
-        await ctx.reply(T.welcome.replace(/\n\n.*$/s, ''), getMenu(lang)); // короткий привет без строки про подписку
+        await ctx.reply(lang === 'en' ? '✅ Language set.' : '✅ Язык выбран.', getMenu(lang));
         return sendAppEntry(ctx, lang);
       });
 
-      // check subscription button
+      // check_sub button
       bot.action('check_sub', async (ctx) => {
         const lang = await getUserLang(ctx.from.id);
-        const ok = await isSubscribed(bot, ctx.from.id);
-        await ctx.answerCbQuery(ok ? 'OK' : 'Not subscribed');
+        await ctx.answerCbQuery();
 
+        const ok = await isSubscribed(bot, ctx.from.id);
         if (!ok) {
-          // редактируем сообщение если можно
+          // IMPORTANT: here again channel button (not webapp)
           try {
             await ctx.editMessageText(TEXTS[lang].sub_error, Markup.inlineKeyboard([
               [Markup.button.url('📢 Channel', CHANNEL_URL)],
@@ -876,23 +876,24 @@ if (TG_BOT_TOKEN) {
           }
         }
 
-        const T = TEXTS[lang] || TEXTS.ru;
         await ctx.reply('✅ OK', getMenu(lang));
         return sendAppEntry(ctx, lang);
       });
 
-      // middleware: block menu usage if not subscribed (except admin)
+      // Middleware: block menu usage if not subscribed (except admin)
       bot.use(async (ctx, next) => {
         if (!ctx.from) return next();
         if (String(ctx.from.id) === String(ADMIN_ID)) return next();
 
-        const txt = ctx.message?.text || '';
-        const isCommand = txt.startsWith('/');
-        const allowList = ['/start', '/admin', '/give', '/del', '/force'];
-        if (isCommand && allowList.includes(txt.split(' ')[0])) return next();
+        const allowCommands = ['/start', '/admin', '/give', '/del', '/force'];
+        const text = ctx.message?.text || '';
+        if (text.startsWith('/')) {
+          const cmd = text.split(' ')[0];
+          if (allowCommands.includes(cmd)) return next();
+        }
 
-        // only gate text messages / menu clicks
-        if (ctx.message && ctx.message.text) {
+        // gate any messages (text/photo etc)
+        if (ctx.message) {
           const lang = await getUserLang(ctx.from.id);
           const ok = await isSubscribed(bot, ctx.from.id);
           if (!ok) {
@@ -903,43 +904,30 @@ if (TG_BOT_TOKEN) {
         return next();
       });
 
-      // ---- MENU: APP ----
+      // Menu: App
       bot.hears([/🚀 Vortex App/, /App/], async (ctx) => {
         const lang = await getUserLang(ctx.from.id);
-        const ok = await isSubscribed(bot, ctx.from.id);
-        if (!ok) return sendSubscribeGate(ctx, lang);
         return sendAppEntry(ctx, lang);
       });
 
-      // ---- PROFILE ----
-      bot.hears([/👤 Профиль/, /👤 Profile/], async (ctx) => {
-        const lang = await getUserLang(ctx.from.id);
-        const T = TEXTS[lang] || TEXTS.ru;
-        const u = await User.findOne({ tgId: String(ctx.from.id) }).catch(() => null);
-        const isPro = u && u.isPremium && u.expiresAt > Date.now();
-        let statusText = T.no_sub;
-        if (isPro) {
-          const days = Math.ceil((u.expiresAt - Date.now()) / (1000 * 60 * 60 * 24));
-          statusText = `PRO (${days} ${T.days_left})`;
-        }
-        return ctx.reply(`${T.profile}\n\nID: ${ctx.from.id}\nUser: @${ctx.from.username || '—'}\nStatus: ${statusText}`);
-      });
-
-      // ---- SETTINGS ----
+      // Menu: Settings
       bot.hears([/⚙️ Настройки/, /⚙️ Settings/], async (ctx) => {
         const lang = await getUserLang(ctx.from.id);
         const T = TEXTS[lang] || TEXTS.ru;
         const u = await User.findOne({ tgId: String(ctx.from.id) }).catch(() => null);
-        const s = u?.notificationsEnabled ? 'ON' : 'OFF';
-        return ctx.reply(`${T.settings}\n\n${T.alerts} ${s}`, Markup.inlineKeyboard([
-          [Markup.button.callback(T.lang_btn, 'change_lang')],
-          [Markup.button.callback('Toggle Alerts', 'toggle_alerts')]
-        ]));
+        const s = u?.notificationsEnabled ? '✅ ON' : '❌ OFF';
+        return ctx.reply(`${T.settings}\n\n${T.alerts} ${s}`, {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback(T.lang_btn, 'change_lang')],
+            [Markup.button.callback('Toggle Alerts', 'toggle_alerts')]
+          ])
+        });
       });
 
       bot.action('change_lang', async (ctx) => {
         await ctx.answerCbQuery();
-        return ctx.reply('🌐 Choose language / Выберите язык', Markup.inlineKeyboard([
+        return ctx.reply(TEXTS.ru.lang_select, Markup.inlineKeyboard([
           Markup.button.callback('🇷🇺 Русский', 'lang_ru'),
           Markup.button.callback('🇺🇸 English', 'lang_en')
         ]));
@@ -951,10 +939,33 @@ if (TG_BOT_TOKEN) {
         if (!u?.isPremium) return ctx.reply('PRO only');
         u.notificationsEnabled = !u.notificationsEnabled;
         await u.save().catch(() => {});
-        return ctx.reply(`Alerts: ${u.notificationsEnabled ? 'ON' : 'OFF'}`);
+        return ctx.reply(u.notificationsEnabled ? 'Alerts: ON' : 'Alerts: OFF');
       });
 
-      // ---- PREMIUM ----
+      // Menu: Help
+      bot.hears([/❓ Help/, /❓ Помощь/], async (ctx) => {
+        const lang = await getUserLang(ctx.from.id);
+        const T = TEXTS[lang] || TEXTS.ru;
+        return ctx.reply(T.help, { parse_mode: 'Markdown' });
+      });
+
+      // Profile (optional)
+      bot.hears([/👤 Профиль/, /👤 Profile/], async (ctx) => {
+        const lang = await getUserLang(ctx.from.id);
+        const T = TEXTS[lang] || TEXTS.ru;
+        const u = await User.findOne({ tgId: String(ctx.from.id) }).catch(() => null);
+        const isPro = u && u.isPremium && u.expiresAt > Date.now();
+
+        let statusText = T.no_sub;
+        if (isPro) {
+          const days = Math.ceil((u.expiresAt - Date.now()) / (1000 * 60 * 60 * 24));
+          statusText = `PRO (${days} ${T.days_left})`;
+        }
+
+        return ctx.reply(`${T.profile}\n\nID: ${ctx.from.id}\nUser: @${ctx.from.username || '—'}\nStatus: ${statusText}`);
+      });
+
+      // Premium
       bot.hears([/💎 Premium/, /💎 Премиум/], async (ctx) => {
         const lang = await getUserLang(ctx.from.id);
         const T = TEXTS[lang] || TEXTS.ru;
@@ -987,10 +998,7 @@ if (TG_BOT_TOKEN) {
         const T = TEXTS[lang] || TEXTS.ru;
         await ctx.answerCbQuery();
 
-        const msg = lang === 'en'
-          ? 'Hello, I want to buy Premium.'
-          : 'Привет, нужны реквизиты для оплаты.';
-
+        const msg = lang === 'en' ? 'Hello, I want to buy Premium.' : 'Привет, нужны реквизиты для оплаты.';
         const link = `https://t.me/${MANAGER_USERNAME}?text=${encodeURIComponent(msg)}`;
 
         return ctx.editMessageText(T.manual_pay, {
@@ -1005,9 +1013,10 @@ if (TG_BOT_TOKEN) {
 
       bot.action('paid_manual', async (ctx) => {
         const lang = await getUserLang(ctx.from.id);
+        const T = TEXTS[lang] || TEXTS.ru;
         await ctx.answerCbQuery();
         pendingVerifications.set(ctx.from.id, true);
-        return ctx.reply(lang === 'en' ? 'Send payment screenshot.' : 'Отправь скрин оплаты.');
+        return ctx.reply(lang === 'en' ? 'Send payment screenshot.' : 'Отправьте скрин оплаты.');
       });
 
       bot.on('photo', async (ctx) => {
@@ -1015,7 +1024,6 @@ if (TG_BOT_TOKEN) {
         pendingVerifications.delete(ctx.from.id);
 
         const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-
         await ctx.reply('OK. Sent to admin.');
 
         try {
@@ -1048,26 +1056,28 @@ if (TG_BOT_TOKEN) {
         try { await ctx.editMessageCaption((ctx.callbackQuery.message.caption || '') + '\n\nRejected'); } catch (_) {}
       });
 
-      // Stars (оставил, но без provider_token работать не будет)
       bot.action('pay_stars', async (ctx) => {
         await ctx.answerCbQuery('Stars not configured');
       });
 
-      // ---- MARKET ----
+      // Market (FIXED – без синтаксической ошибки)
       bot.hears(/📊 Market|📊 Рынок/, async (ctx) => {
         const lang = await getUserLang(ctx.from.id);
         const T = TEXTS[lang] || TEXTS.ru;
 
         const msg = await ctx.reply(T.market);
+
         try {
           const all = await fetch24hrTickers();
-          if (!all) throw new Error('API fail');
+          if (!all) throw new Error('API Fail');
 
           const btc = all.find(x => x.symbol === 'BTCUSDT');
+
           const gainers = all
             .filter(x => String(x.symbol).endsWith('USDT') && Number(x.quoteVolume) > 1_000_000)
             .sort((a, b) => Number(b.priceChangePercent) - Number(a.priceChangePercent))
             .slice(0, 3);
+
           const losers = all
             .filter(x => String(x.symbol).endsWith('USDT') && Number(x.quoteVolume) > 1_000_000)
             .sort((a, b) => Number(a.priceChangePercent) - Number(b.priceChangePercent))
@@ -1077,25 +1087,18 @@ if (TG_BOT_TOKEN) {
           if (btc) text += `BTC: $${Number(btc.lastPrice).toFixed(0)} (${Number(btc.priceChangePercent).toFixed(2)}%)\n\n`;
 
           text += `<b>Top Gainers</b>\n`;
-          gainers.forEach(c => text += `• ${c.symbol}: +${Number(c.priceChangePercent).toFixed(1)}%\n`);
+          gainers.forEach(c => { text += `• ${c.symbol}: +${Number(c.priceChangePercent).toFixed(1)}%\n`; });
 
           text += `\n<b>Top Losers</b>\n`;
-          losers.forEach(c => text += `• ${c.symbol}: ${Number(c.priceChangePercent).toFixed(1)}%\n`;
+          losers.forEach(c => { text += `• ${c.symbol}: ${Number(c.priceChangePercent).toFixed(1)}%\n`; });
 
-          await bot.telegram.editMessageText(ctx.chat.id, msg.message_id, null, text, { parse_mode: 'HTML' });
-        } catch (e) {
-          try { await bot.telegram.editMessageText(ctx.chat.id, msg.message_id, null, 'Market unavailable'); } catch (_) {}
+          await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, text, { parse_mode: 'HTML' });
+        } catch (_) {
+          try { await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, 'Market unavailable'); } catch (_) {}
         }
       });
 
-      // ---- HELP ----
-      bot.hears(/❓ Help|❓ Помощь/, async (ctx) => {
-        const lang = await getUserLang(ctx.from.id);
-        const T = TEXTS[lang] || TEXTS.ru;
-        return ctx.reply(T.help, { parse_mode: 'Markdown' });
-      });
-
-      // ---- ADMIN ----
+      // Admin
       bot.command('admin', async (ctx) => {
         if (String(ctx.from.id) !== String(ADMIN_ID)) return;
         const count = await User.countDocuments().catch(() => 0);
@@ -1144,10 +1147,7 @@ if (TG_BOT_TOKEN) {
           source: 'manual'
         });
 
-        // broadcast immediately
-        const payload = buildPayload();
-        persistAndBroadcast(payload);
-
+        persistAndBroadcast(buildPayload());
         return ctx.reply(`Forced: ${sym}`);
       });
 
@@ -1156,6 +1156,7 @@ if (TG_BOT_TOKEN) {
 
       process.once('SIGINT', () => bot.stop('SIGINT'));
       process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
     } catch (e) {
       console.error('[bot] failed to start:', e?.message || e);
     }
@@ -1164,7 +1165,7 @@ if (TG_BOT_TOKEN) {
   console.log('[bot] TG_BOT_TOKEN missing, bot disabled');
 }
 
-// ------------------- WEBAPP API -------------------
+// ------------------- API for WebApp -------------------
 app.get('/api/user/status', async (req, res) => {
   const id = req.query.tg_id;
   const hasAccess = await checkUser(id);
@@ -1198,14 +1199,10 @@ app.get('/events', (req, res) => {
   });
 
   sseClients.add(res);
-
   if (fs.existsSync(DATA_FILE)) {
     res.write(`event: scheduled_update\ndata: ${fs.readFileSync(DATA_FILE, 'utf8')}\n\n`);
   }
-
-  req.on('close', () => {
-    sseClients.delete(res);
-  });
+  req.on('close', () => sseClients.delete(res));
 });
 
 app.get('/api/live/candles', async (req, res) => {
@@ -1246,7 +1243,7 @@ app.get('/api/live/stream', (req, res) => {
   req.on('close', () => clearInterval(iv));
 });
 
-// ------------------- FRONTEND SERVE -------------------
+// ------------------- Frontend serve -------------------
 app.use(express.static(path.join(__dirname, '../dist')));
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api') || req.path.startsWith('/events')) return;
