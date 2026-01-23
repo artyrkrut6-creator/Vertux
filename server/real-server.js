@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { BollingerBands } = require('technicalindicators');
 const mongoose = require('mongoose');
@@ -16,14 +17,25 @@ const PORT = Number(process.env.PORT || 5176);
 const app = express();
 
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: '2mb' }));
+
+// IMPORTANT: keep raw body for CryptoPay webhook signature verification
+app.use(
+  express.json({
+    limit: '2mb',
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 const DATA_FILE = path.join(__dirname, 'last_scheduled_prediction.json');
 
 const PROXY_URL = process.env.PROXY_URL || null;
 let agent = null;
 if (PROXY_URL) {
-  try { agent = new HttpsProxyAgent(PROXY_URL); } catch (_) {}
+  try {
+    agent = new HttpsProxyAgent(PROXY_URL);
+  } catch (_) {}
 }
 
 // ------------------- CONFIG -------------------
@@ -40,11 +52,19 @@ const AI_INTERVAL = 300_000;
 const LOOP_INTERVAL = 30_000;
 
 const SIGNAL_AUTO_REMOVE_MS = 3000;
-const AI_MAX_ACTIVE = 1; // максимум 1 активный AI сигнал
+const AI_MAX_ACTIVE = 1;
 const COOLDOWN_MS = 15 * 60_000;
+
+// NEW: AI max lifetime 10 hours
+const AI_MAX_LIFETIME_MS = 10 * 60 * 60_000;
 
 const SILICON_KEY = process.env.SILICON_KEY || null;
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || null;
+
+// Crypto Bot / Crypto Pay API token
+const CRYPTO_PAY_TOKEN = process.env.CRYPTO_PAY_TOKEN || process.env.CRYPTO_BOT_TOKEN || null;
+// subscription price in USDT for CryptoPay invoices
+const PREMIUM_PRICE_USDT = Number(process.env.PREMIUM_PRICE_USDT || 10);
 
 const WEBAPP_URL = process.env.WEBAPP_URL || 'https://vortex-ai-nffc.onrender.com';
 const MONGO_URI = process.env.MONGO_URI || null;
@@ -60,15 +80,20 @@ let scanInFlight = false;
 let nextFtScan = Date.now() + FT_INTERVAL;
 let nextAiScan = Date.now() + AI_INTERVAL;
 
-const activeSignals = new Map(); // persistent AI signals
-let lastFtPicks = []; // snapshot FT list
+const activeSignals = new Map();
+let lastFtPicks = [];
 
 const cooldowns = new Map(); // symbol -> cooldownUntil
 const sseClients = new Set();
 const pendingVerifications = new Map();
 
+// timers to remove signals “almost instantly”
+const removalTimers = new Map(); // symbol -> timeoutId
+
 // ------------------- HELPERS -------------------
-function normalizeSymbol(s) { return String(s || '').trim().toUpperCase(); }
+function normalizeSymbol(s) {
+  return String(s || '').trim().toUpperCase();
+}
 
 function safeNum(x) {
   const n = Number(x);
@@ -81,13 +106,25 @@ function clamp(n, a, b) {
 
 function sseBroadcast(evt, data) {
   const payload = `event: ${evt}\ndata: ${JSON.stringify(data)}\n\n`;
-  sseClients.forEach((c) => { try { c.write(payload); } catch (_) {} });
+  sseClients.forEach((c) => {
+    try {
+      c.write(payload);
+    } catch (_) {}
+  });
 }
 
-function isSaneUsdtSymbol(sym) { return /^[A-Z0-9]{2,}USDT$/.test(sym); }
-function isStablecoinLike(sym) { return /USDC|USDP|TUSD|DAI|FDUSD|USD1|USDE|PAXG|EUR|GBP/.test(sym); }
-function isLeveraged(sym) { return /(3L|3S|5L|5S|UP|DOWN|BULL|BEAR)USDT$/.test(sym); }
-function isTokenizedStock(sym) { return /ONUSDT$/.test(sym); }
+function isSaneUsdtSymbol(sym) {
+  return /^[A-Z0-9]{2,}USDT$/.test(sym);
+}
+function isStablecoinLike(sym) {
+  return /USDC|USDP|TUSD|DAI|FDUSD|USD1|USDE|PAXG|EUR|GBP/.test(sym);
+}
+function isLeveraged(sym) {
+  return /(3L|3S|5L|5S|UP|DOWN|BULL|BEAR)USDT$/.test(sym);
+}
+function isTokenizedStock(sym) {
+  return /ONUSDT$/.test(sym);
+}
 
 function isInCooldown(symbol) {
   const sym = normalizeSymbol(symbol);
@@ -119,11 +156,35 @@ function countActiveAiActiveOnly() {
   return n;
 }
 
+function scheduleRemoval(symbol) {
+  const sym = normalizeSymbol(symbol);
+  const sig = activeSignals.get(sym);
+  if (!sig?.removeAt) return;
+
+  // clear old timer
+  const old = removalTimers.get(sym);
+  if (old) clearTimeout(old);
+
+  const delay = Math.max(0, sig.removeAt - Date.now()) + 50;
+  const t = setTimeout(() => {
+    const s = activeSignals.get(sym);
+    if (s && s.removeAt && Date.now() >= s.removeAt) {
+      activeSignals.delete(sym);
+      persistAndBroadcast(buildPayload());
+    }
+    removalTimers.delete(sym);
+  }, delay);
+
+  removalTimers.set(sym, t);
+}
+
 async function mexcFetchJSON(url) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), 10_000);
   try {
-    const res = agent ? await fetch(url, { agent, signal: controller.signal }) : await fetch(url, { signal: controller.signal });
+    const res = agent
+      ? await fetch(url, { agent, signal: controller.signal })
+      : await fetch(url, { signal: controller.signal });
     clearTimeout(id);
     if (!res.ok) return null;
     return res.json();
@@ -158,7 +219,8 @@ function relStdDevPct(closes) {
 
 function calculateRSI(closes, period = 14) {
   if (closes.length < period + 1) return 50;
-  let gains = 0, losses = 0;
+  let gains = 0,
+    losses = 0;
 
   for (let i = 1; i <= period; i++) {
     const change = closes[i] - closes[i - 1];
@@ -417,32 +479,47 @@ async function deepseekExecution(winner) {
 }
 
 // ------------------- SIGNAL LIFECYCLE -------------------
+function markSignalDone(sym, status) {
+  const s = activeSignals.get(sym);
+  if (!s) return;
+  s.status = status;
+  s.removeAt = Date.now() + SIGNAL_AUTO_REMOVE_MS;
+  putCooldown(sym);
+  scheduleRemoval(sym);
+}
+
 function updateSignalStatus(sig, price) {
   if (!sig || sig.status !== 'ACTIVE') return false;
 
   let done = false;
-
   if (sig.direction === 'LONG') {
-    if (price >= sig.target_price) { sig.status = 'WON'; done = true; }
-    else if (price <= sig.stop_loss_price) { sig.status = 'LOST'; done = true; }
+    if (price >= sig.target_price) { done = true; markSignalDone(sig.symbol, 'WON'); }
+    else if (price <= sig.stop_loss_price) { done = true; markSignalDone(sig.symbol, 'LOST'); }
   } else {
-    if (price <= sig.target_price) { sig.status = 'WON'; done = true; }
-    else if (price >= sig.stop_loss_price) { sig.status = 'LOST'; done = true; }
-  }
-
-  if (done) {
-    sig.removeAt = Date.now() + SIGNAL_AUTO_REMOVE_MS;
-    putCooldown(sig.symbol);
+    if (price <= sig.target_price) { done = true; markSignalDone(sig.symbol, 'WON'); }
+    else if (price >= sig.stop_loss_price) { done = true; markSignalDone(sig.symbol, 'LOST'); }
   }
 
   return done;
 }
 
-function cleanupExpiredSignals() {
+function expireOldSignals() {
   const now = Date.now();
+  let changed = false;
   for (const [sym, sig] of activeSignals.entries()) {
-    if (sig?.removeAt && now >= sig.removeAt) activeSignals.delete(sym);
+    if (!sig || sig.tag !== 'AI') continue;
+    if (String(sig.status || '').toUpperCase() !== 'ACTIVE') continue;
+
+    const startedAt = Number(sig.addedAt || sig.detectedAt || 0) || now;
+    if (now - startedAt >= AI_MAX_LIFETIME_MS) {
+      sig.status = 'EXPIRED';
+      sig.removeAt = now + SIGNAL_AUTO_REMOVE_MS;
+      putCooldown(sym);
+      scheduleRemoval(sym);
+      changed = true;
+    }
   }
+  if (changed) persistAndBroadcast(buildPayload());
 }
 
 // ------------------- PERSIST / PAYLOAD -------------------
@@ -502,6 +579,10 @@ function loadPersistedSignals() {
           confidence: f?.confidence ?? d.confidence ?? 0,
           removeAt: f?.removeAt ?? d.removeAt ?? null,
         });
+
+        // if already marked for removal => schedule
+        const sig = activeSignals.get(sym);
+        if (sig?.removeAt) scheduleRemoval(sym);
       }
     });
 
@@ -517,6 +598,7 @@ function loadPersistedSignals() {
         if (String(sig.status || '').toUpperCase() === 'ACTIVE' && !keep.has(sym)) {
           sig.status = 'STALE';
           sig.removeAt = Date.now() + SIGNAL_AUTO_REMOVE_MS;
+          scheduleRemoval(sym);
         }
       }
     }
@@ -548,7 +630,7 @@ async function runScannerJob() {
     const baseMap = new Map(base.map((b) => [b.symbol, b]));
     const now = Date.now();
 
-    // update AI signals
+    // update AI signals (TP/SL checks)
     for (const [sym, sig] of activeSignals.entries()) {
       const tick = baseMap.get(sym);
       if (!tick) continue;
@@ -557,8 +639,8 @@ async function runScannerJob() {
       if (sig.status === 'ACTIVE') updateSignalStatus(sig, price);
     }
 
-    cleanupExpiredSignals();
     cleanupCooldowns();
+    expireOldSignals();
 
     // AI scan
     if (now >= nextAiScan) {
@@ -590,7 +672,6 @@ async function runScannerJob() {
         }
 
         const top5 = buildTop5Candidates(enriched);
-
         if (top5.length) {
           const winner = await deepseekSelectWinner(top5);
           if (winner && countActiveAiActiveOnly() < AI_MAX_ACTIVE) {
@@ -604,11 +685,13 @@ async function runScannerJob() {
                 quoteVolume: winner.quoteVolume,
                 change24hPct: winner.priceChangePercent ?? 0,
                 stdDev: winner.stdDev ?? 0,
+
                 target_price: exec.target_price,
                 stop_loss_price: exec.stop_loss_price,
                 direction: exec.direction,
                 confidence: exec.confidence ?? 0,
                 forecastCandles: exec.candles || [],
+
                 detectedAt: Date.now(),
                 status: 'ACTIVE',
                 addedAt: Date.now(),
@@ -620,7 +703,7 @@ async function runScannerJob() {
       }
     }
 
-    // FT scan
+    // FT scan (snapshot, expiresAt = nextFtScan)
     if (now >= nextFtScan) {
       nextFtScan = now + FT_INTERVAL;
 
@@ -657,7 +740,7 @@ async function runScannerJob() {
               signal,
               stdDev: relStdDevPct(closes),
               detectedAt: Date.now(),
-              expiresAt: nextFtScan, // FIX: no 1000h
+              expiresAt: nextFtScan, // FIX: FT never "1000 hours"
             });
           })
         );
@@ -666,11 +749,11 @@ async function runScannerJob() {
       const longs = ftPicks.filter((f) => f.signal === 'LONG').slice(0, 7);
       const shorts = ftPicks.filter((f) => f.signal === 'SHORT').slice(0, 7);
       const vols = ftPicks.filter((f) => f.signal === 'NEUTRAL').slice(0, 6);
+
       lastFtPicks = [...longs, ...shorts, ...vols];
     }
 
-    const payload = buildPayload();
-    persistAndBroadcast(payload);
+    persistAndBroadcast(buildPayload());
   } catch (e) {
     console.error(e);
   } finally {
@@ -694,6 +777,17 @@ const UserSchema = new mongoose.Schema({
   username: String,
 });
 const User = mongoose.models.User || mongoose.model('User', UserSchema);
+
+const InvoiceSchema = new mongoose.Schema({
+  invoiceId: { type: Number, unique: true },
+  tgId: String,
+  status: String,
+  createdAt: Number,
+  payUrl: String,
+  asset: String,
+  amount: String,
+});
+const Invoice = mongoose.models.Invoice || mongoose.model('Invoice', InvoiceSchema);
 
 async function activateUser(id) {
   try {
@@ -723,30 +817,118 @@ async function getUserLang(tgId) {
   }
 }
 
-async function notifyProUsers(message, bot) {
-  try {
-    const users = await User.find({ isPremium: true, notificationsEnabled: true }).lean().exec();
-    for (const u of users) {
-      try { await bot.telegram.sendMessage(u.tgId, message); } catch (_) {}
-    }
-  } catch (_) {}
+// ------------------- CRYPTO PAY API -------------------
+async function cryptoPayRequest(method, params = {}) {
+  if (!CRYPTO_PAY_TOKEN) throw new Error('CRYPTO_PAY_TOKEN missing');
+
+  const r = await fetch(`https://pay.crypt.bot/api/${method}`, {
+    method: 'POST',
+    headers: {
+      'Crypto-Pay-API-Token': CRYPTO_PAY_TOKEN,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(params),
+  });
+
+  const j = await r.json().catch(() => null);
+  if (!j || !j.ok) {
+    const msg = j?.error?.name || j?.error || `CryptoPay ${method} failed`;
+    throw new Error(msg);
+  }
+  return j.result;
 }
 
-// ------------------- TEXTS (FULL) -------------------
+async function cryptoPayCreateInvoice({ tgId }) {
+  const amount = String(PREMIUM_PRICE_USDT.toFixed(2));
+  const asset = 'USDT';
+
+  const result = await cryptoPayRequest('createInvoice', {
+    asset,
+    amount,
+    description: 'Vortex PRO (1 month)',
+    // after payment button inside Crypto Bot (optional)
+    paid_btn_name: 'openBot',
+    paid_btn_url: WEBAPP_URL,
+  });
+
+  // result: { invoice_id, pay_url, ... }
+  const invoiceId = Number(result.invoice_id);
+  const payUrl = String(result.pay_url);
+
+  await Invoice.findOneAndUpdate(
+    { invoiceId },
+    {
+      invoiceId,
+      tgId: String(tgId),
+      status: 'active',
+      createdAt: Date.now(),
+      payUrl,
+      asset,
+      amount,
+    },
+    { upsert: true }
+  );
+
+  return { invoiceId, payUrl, asset, amount };
+}
+
+async function cryptoPayGetInvoice(invoiceId) {
+  const res = await cryptoPayRequest('getInvoices', { invoice_ids: String(invoiceId) });
+  const inv = res?.items?.[0];
+  return inv || null;
+}
+
+// Webhook endpoint for CryptoPay (optional but recommended)
+app.post('/api/crypto/webhook', async (req, res) => {
+  try {
+    // signature verify (if token set)
+    if (CRYPTO_PAY_TOKEN) {
+      const sig = req.headers['crypto-pay-api-signature'];
+      if (sig) {
+        const raw = req.rawBody ? Buffer.from(req.rawBody) : Buffer.from(JSON.stringify(req.body || {}));
+        const h = crypto.createHmac('sha256', CRYPTO_PAY_TOKEN).update(raw).digest('hex');
+        if (String(sig) !== h) {
+          return res.status(401).send('bad signature');
+        }
+      }
+    }
+
+    const update = req.body || {};
+    // update.payload.invoice_id (usually)
+    const payload = update.payload || {};
+    const invoiceId = Number(payload.invoice_id || payload.invoiceId);
+    const status = String(payload.status || '');
+
+    if (invoiceId) {
+      const doc = await Invoice.findOne({ invoiceId }).catch(() => null);
+      if (doc && (status === 'paid' || status === 'completed')) {
+        await Invoice.findOneAndUpdate({ invoiceId }, { status: 'paid' }).catch(() => {});
+        await activateUser(doc.tgId);
+      }
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[crypto webhook] error', e);
+    return res.json({ ok: true }); // do not retry forever
+  }
+});
+
+// ------------------- TEXTS -------------------
 const TEXTS = {
   ru: {
     welcome: "👋 Добро пожаловать в Vortex AI!\n\nПожалуйста, подпишитесь на наш канал, чтобы продолжить.",
     sub_check: "🔄 Проверить подписку",
     sub_error: "❌ Вы не подписаны на канал.",
     lang_select: "🌐 Выберите язык / Select Language:",
-    menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Рынок", settings: "⚙️ Настройки", help: "❓ Помощь", profile: "👤 Профиль" },
+    menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Рынок", settings: "⚙️ Настройки", help: "❓ Помощь" },
     market: "🔄 Сканирую рынок...",
     premium_status: "✅ Ваш статус: PRO",
     premium_buy: "💎 **VORTEX PRO**\n\n• AI Снайпер Сигналы\n• Без задержек\n• Полный доступ\n\n**Цена:** 1000 RUB / 1 Месяц",
     pay_methods: { crypto: "💠 Крипта (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Карта РФ" },
     disclaimer: "⚠️ **ЮРИДИЧЕСКИЙ ДИСКЛЕЙМЕР**\n\nТорговля — риск. Возврата нет.",
     agree_pay: "✅ Согласен, Оплатить",
-    manual_pay: "💳 **Способ оплаты: Перевод на карту** 🇷🇺\n💰 **К оплате:** 1000 RUB\n\n👋 Напиши менеджеру по кнопке ниже, он выдаст реквизиты.\n\nПОСЛЕ ПЕРЕВОДА — возвращайся сюда и жми кнопку **\"✅ Я Оплатил\"**. Затем отправляй скриншот.\n\n_Доступ выдаётся в течение 5 минут._",
+    manual_pay: "💳 **Способ оплаты: Перевод на карту**\n\n👋 Напиши менеджеру по кнопке ниже.\n\nПосле оплаты нажми \"✅ Я Оплатил\" и отправь скриншот.\n\nДоступ выдаётся в течение 5 минут.",
     btn_manager: "📩 Написать Менеджеру",
     btn_paid: "✅ Я Оплатил",
     btn_back: "🔙 Назад",
@@ -756,15 +938,19 @@ const TEXTS = {
     profile: "👤 **ПРОФИЛЬ**",
     no_sub: "❌ Нет подписки",
     days_left: "дней",
-    help: "📚 **ПОМОЩЬ**\n\n• **AI Signals:** входы от DeepSeek.\n• **FT:** RSI зоны.\n\nSupport: @meanfive1",
-    app_desc: "📱 **Vortex Web App**\n\nНажмите кнопку ниже, чтобы запустить:"
+    help: "📚 **ПОМОЩЬ**\n\n• AI Signals: входы от DeepSeek.\n• FT: RSI зоны.\n\nSupport: @meanfive1",
+    app_desc: "📱 **Vortex Web App**\n\nНажмите кнопку ниже, чтобы запустить:",
+    crypto_invoice: "💠 **Оплата криптой (Crypto Bot)**\n\nНажми кнопку ниже и оплати инвойс.\nПосле оплаты нажми «Проверить оплату».",
+    crypto_check: "🔄 Проверить оплату",
+    crypto_wait: "⏳ Оплата не найдена. Если оплатили только что — подождите 10-20 секунд и проверьте ещё раз.",
+    crypto_ok: "✅ Оплата подтверждена. Premium активирован.",
   },
   en: {
     welcome: "👋 Welcome to Vortex AI!\n\nPlease subscribe to our channel to continue.",
     sub_check: "🔄 Check Subscription",
     sub_error: "❌ You are not subscribed.",
     lang_select: "🌐 Select Language:",
-    menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Market", settings: "⚙️ Settings", help: "❓ Help", profile: "👤 Profile" },
+    menu: { app: "🚀 Vortex App", premium: "💎 Premium", market: "📊 Market", settings: "⚙️ Settings", help: "❓ Help" },
     app_desc: "📱 **Vortex Web App**\n\nClick below to launch:",
     market: "🔄 Scanning...",
     premium_status: "✅ Your Status: PRO",
@@ -772,7 +958,7 @@ const TEXTS = {
     pay_methods: { crypto: "💠 Crypto (USDT)", stars: "⭐️ Telegram Stars", card: "💳 Bank Card" },
     disclaimer: "⚠️ **LEGAL DISCLAIMER**\n\nTrading involves risk. No refunds.",
     agree_pay: "✅ I Agree & Pay",
-    manual_pay: "💳 **Payment Method: Bank Card**\n💰 **Price:** $10\n\nContact manager below.\n\nAFTER PAYMENT — come back and click **\"✅ I Paid\"**. Then send a screenshot.\n\n_Access granted within 5 mins._",
+    manual_pay: "💳 **Payment Method: Bank Card**\n\nContact manager below.\n\nAfter payment click «✅ I Paid» and send screenshot.\n\nAccess granted within 5 mins.",
     btn_manager: "📩 Contact Manager",
     btn_paid: "✅ I Paid",
     btn_back: "🔙 Back",
@@ -782,17 +968,21 @@ const TEXTS = {
     profile: "👤 **PROFILE**",
     no_sub: "❌ No Subscription",
     days_left: "days",
-    help: "📚 **HELP**\n\n• **AI Signals:** DeepSeek entries.\n• **FT:** RSI zones.\n\nSupport: @meanfive1"
+    help: "📚 **HELP**\n\n• AI Signals: DeepSeek entries.\n• FT: RSI zones.\n\nSupport: @meanfive1",
+    crypto_invoice: "💠 **Crypto payment (Crypto Bot)**\n\nTap button below to pay.\nAfter payment tap «Check payment».",
+    crypto_check: "🔄 Check payment",
+    crypto_wait: "⏳ Payment not found yet. If you just paid, wait 10-20 seconds and check again.",
+    crypto_ok: "✅ Payment confirmed. Premium activated.",
   }
 };
 
-// ------------------- TELEGRAM BOT (FULL + FIXED SUB BUTTON) -------------------
+// ------------------- TELEGRAM BOT -------------------
 async function isSubscribed(bot, userId) {
   try {
     const member = await bot.telegram.getChatMember(CHANNEL_USERNAME, userId);
     return !['left', 'kicked'].includes(member.status);
-  } catch (e) {
-    // важно: чтобы это работало, бот должен быть админом канала
+  } catch (_) {
+    // if bot can't check, do not hard block (optional)
     return false;
   }
 }
@@ -803,7 +993,7 @@ if (TG_BOT_TOKEN) {
       const bot = new Telegraf(TG_BOT_TOKEN);
       bot.catch((err) => console.error('[bot] runtime error:', err));
 
-      // polling mode (старый код работал так)
+      // Polling (stable)
       try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch (_) {}
 
       const getMenu = (lang) => {
@@ -834,7 +1024,6 @@ if (TG_BOT_TOKEN) {
         );
       };
 
-      // Start => language select
       bot.command('start', async (ctx) => {
         await ctx.reply(TEXTS.ru.lang_select, Markup.inlineKeyboard([
           Markup.button.callback('🇷🇺 Русский', 'lang_ru'),
@@ -842,29 +1031,25 @@ if (TG_BOT_TOKEN) {
         ]));
       });
 
-      // after language select => check subscription, if not subscribed => show channel button
       bot.action(/^lang_(.+)$/, async (ctx) => {
         const lang = ctx.match[1] === 'en' ? 'en' : 'ru';
         await ctx.answerCbQuery();
         try { await ctx.deleteMessage(); } catch (_) {}
-
         try { await User.findOneAndUpdate({ tgId: String(ctx.from.id) }, { language: lang }, { upsert: true }); } catch (_) {}
 
         const ok = await isSubscribed(bot, ctx.from.id);
         if (!ok) return sendSubscribeGate(ctx, lang);
 
-        await ctx.reply(lang === 'en' ? '✅ Language set.' : '✅ Язык выбран.', getMenu(lang));
+        await ctx.reply('✅ OK', getMenu(lang));
         return sendAppEntry(ctx, lang);
       });
 
-      // check_sub button
       bot.action('check_sub', async (ctx) => {
         const lang = await getUserLang(ctx.from.id);
         await ctx.answerCbQuery();
 
         const ok = await isSubscribed(bot, ctx.from.id);
         if (!ok) {
-          // IMPORTANT: here again channel button (not webapp)
           try {
             await ctx.editMessageText(TEXTS[lang].sub_error, Markup.inlineKeyboard([
               [Markup.button.url('📢 Channel', CHANNEL_URL)],
@@ -880,23 +1065,21 @@ if (TG_BOT_TOKEN) {
         return sendAppEntry(ctx, lang);
       });
 
-      // Middleware: block menu usage if not subscribed (except admin)
+      // Gate all messages if not subscribed (except admin/start/lang)
       bot.use(async (ctx, next) => {
         if (!ctx.from) return next();
         if (String(ctx.from.id) === String(ADMIN_ID)) return next();
 
-        const allowCommands = ['/start', '/admin', '/give', '/del', '/force'];
         const text = ctx.message?.text || '';
-        if (text.startsWith('/')) {
-          const cmd = text.split(' ')[0];
-          if (allowCommands.includes(cmd)) return next();
-        }
+        if (text.startsWith('/start')) return next();
 
-        // gate any messages (text/photo etc)
-        if (ctx.message) {
-          const lang = await getUserLang(ctx.from.id);
+        // allow callbacks for language and check_sub
+        if (ctx.callbackQuery?.data && /^(lang_|check_sub)/.test(ctx.callbackQuery.data)) return next();
+
+        if (ctx.message || ctx.callbackQuery) {
           const ok = await isSubscribed(bot, ctx.from.id);
           if (!ok) {
+            const lang = await getUserLang(ctx.from.id);
             await sendSubscribeGate(ctx, lang);
             return;
           }
@@ -904,13 +1087,13 @@ if (TG_BOT_TOKEN) {
         return next();
       });
 
-      // Menu: App
+      // App
       bot.hears([/🚀 Vortex App/, /App/], async (ctx) => {
         const lang = await getUserLang(ctx.from.id);
         return sendAppEntry(ctx, lang);
       });
 
-      // Menu: Settings
+      // Settings
       bot.hears([/⚙️ Настройки/, /⚙️ Settings/], async (ctx) => {
         const lang = await getUserLang(ctx.from.id);
         const T = TEXTS[lang] || TEXTS.ru;
@@ -942,27 +1125,11 @@ if (TG_BOT_TOKEN) {
         return ctx.reply(u.notificationsEnabled ? 'Alerts: ON' : 'Alerts: OFF');
       });
 
-      // Menu: Help
+      // Help
       bot.hears([/❓ Help/, /❓ Помощь/], async (ctx) => {
         const lang = await getUserLang(ctx.from.id);
         const T = TEXTS[lang] || TEXTS.ru;
         return ctx.reply(T.help, { parse_mode: 'Markdown' });
-      });
-
-      // Profile (optional)
-      bot.hears([/👤 Профиль/, /👤 Profile/], async (ctx) => {
-        const lang = await getUserLang(ctx.from.id);
-        const T = TEXTS[lang] || TEXTS.ru;
-        const u = await User.findOne({ tgId: String(ctx.from.id) }).catch(() => null);
-        const isPro = u && u.isPremium && u.expiresAt > Date.now();
-
-        let statusText = T.no_sub;
-        if (isPro) {
-          const days = Math.ceil((u.expiresAt - Date.now()) / (1000 * 60 * 60 * 24));
-          statusText = `PRO (${days} ${T.days_left})`;
-        }
-
-        return ctx.reply(`${T.profile}\n\nID: ${ctx.from.id}\nUser: @${ctx.from.username || '—'}\nStatus: ${statusText}`);
       });
 
       // Premium
@@ -983,16 +1150,18 @@ if (TG_BOT_TOKEN) {
         const lang = await getUserLang(ctx.from.id);
         const T = TEXTS[lang] || TEXTS.ru;
         await ctx.answerCbQuery();
+
         return ctx.editMessageText(T.premium_buy, {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([
             [Markup.button.callback(T.pay_methods.card, 'pay_manager')],
-            [Markup.button.callback(T.pay_methods.crypto, 'pay_manager')],
+            [Markup.button.callback(T.pay_methods.crypto, 'pay_crypto')],
             [Markup.button.callback(T.pay_methods.stars, 'pay_stars')]
           ])
         });
       });
 
+      // Manager pay (manual)
       bot.action('pay_manager', async (ctx) => {
         const lang = await getUserLang(ctx.from.id);
         const T = TEXTS[lang] || TEXTS.ru;
@@ -1012,11 +1181,9 @@ if (TG_BOT_TOKEN) {
       });
 
       bot.action('paid_manual', async (ctx) => {
-        const lang = await getUserLang(ctx.from.id);
-        const T = TEXTS[lang] || TEXTS.ru;
         await ctx.answerCbQuery();
         pendingVerifications.set(ctx.from.id, true);
-        return ctx.reply(lang === 'en' ? 'Send payment screenshot.' : 'Отправьте скрин оплаты.');
+        return ctx.reply('📸 Отправь скрин оплаты / Send screenshot.');
       });
 
       bot.on('photo', async (ctx) => {
@@ -1056,11 +1223,64 @@ if (TG_BOT_TOKEN) {
         try { await ctx.editMessageCaption((ctx.callbackQuery.message.caption || '') + '\n\nRejected'); } catch (_) {}
       });
 
+      // Crypto payment (Crypto Bot invoice)
+      bot.action('pay_crypto', async (ctx) => {
+        const lang = await getUserLang(ctx.from.id);
+        const T = TEXTS[lang] || TEXTS.ru;
+        await ctx.answerCbQuery();
+
+        if (!CRYPTO_PAY_TOKEN) {
+          return ctx.reply('Crypto pay is not configured on server.');
+        }
+
+        try {
+          const { invoiceId, payUrl, asset, amount } = await cryptoPayCreateInvoice({ tgId: ctx.from.id });
+
+          return ctx.editMessageText(
+            `${T.crypto_invoice}\n\nInvoice: ${invoiceId}\nAmount: ${amount} ${asset}`,
+            {
+              parse_mode: 'Markdown',
+              ...Markup.inlineKeyboard([
+                [Markup.button.url('💠 Pay via Crypto Bot', payUrl)],
+                [Markup.button.callback(T.crypto_check, `check_invoice_${invoiceId}`)],
+                [Markup.button.callback(T.btn_back, 'show_pay')],
+              ]),
+            }
+          );
+        } catch (e) {
+          return ctx.reply('Failed to create crypto invoice: ' + (e?.message || String(e)));
+        }
+      });
+
+      bot.action(/^check_invoice_(\d+)$/, async (ctx) => {
+        const invoiceId = Number(ctx.match[1]);
+        const lang = await getUserLang(ctx.from.id);
+        const T = TEXTS[lang] || TEXTS.ru;
+        await ctx.answerCbQuery();
+
+        if (!CRYPTO_PAY_TOKEN) return ctx.reply('Crypto pay is not configured.');
+
+        try {
+          const inv = await cryptoPayGetInvoice(invoiceId);
+          const status = String(inv?.status || '').toLowerCase();
+
+          if (status === 'paid') {
+            await activateUser(ctx.from.id);
+            await Invoice.findOneAndUpdate({ invoiceId }, { status: 'paid' }).catch(() => {});
+            return ctx.reply(T.crypto_ok);
+          }
+
+          return ctx.reply(T.crypto_wait + `\nStatus: ${status || 'unknown'}`);
+        } catch (e) {
+          return ctx.reply('Check failed: ' + (e?.message || String(e)));
+        }
+      });
+
       bot.action('pay_stars', async (ctx) => {
         await ctx.answerCbQuery('Stars not configured');
       });
 
-      // Market (FIXED – без синтаксической ошибки)
+      // Market (без синтаксических ошибок)
       bot.hears(/📊 Market|📊 Рынок/, async (ctx) => {
         const lang = await getUserLang(ctx.from.id);
         const T = TEXTS[lang] || TEXTS.ru;
@@ -1098,30 +1318,7 @@ if (TG_BOT_TOKEN) {
         }
       });
 
-      // Admin
-      bot.command('admin', async (ctx) => {
-        if (String(ctx.from.id) !== String(ADMIN_ID)) return;
-        const count = await User.countDocuments().catch(() => 0);
-        const pros = await User.countDocuments({ isPremium: true }).catch(() => 0);
-        return ctx.reply(`ADMIN\nTotal: ${count}\nPRO: ${pros}\n\n/give <id>\n/del <id>\n/force <symbol>`);
-      });
-
-      bot.command('give', async (ctx) => {
-        if (String(ctx.from.id) !== String(ADMIN_ID)) return;
-        const id = ctx.message.text.split(' ')[1];
-        if (!id) return ctx.reply('Usage: /give <id>');
-        await activateUser(id);
-        return ctx.reply(`OK: ${id}`);
-      });
-
-      bot.command('del', async (ctx) => {
-        if (String(ctx.from.id) !== String(ADMIN_ID)) return;
-        const id = ctx.message.text.split(' ')[1];
-        if (!id) return ctx.reply('Usage: /del <id>');
-        await User.findOneAndUpdate({ tgId: String(id) }, { isPremium: false, expiresAt: 0 }).catch(() => {});
-        return ctx.reply(`OK: ${id}`);
-      });
-
+      // Admin force
       bot.command('force', async (ctx) => {
         if (String(ctx.from.id) !== String(ADMIN_ID)) return;
         const sym = normalizeSymbol(ctx.message.text.split(' ')[1] || 'BTCUSDT');
@@ -1144,7 +1341,7 @@ if (TG_BOT_TOKEN) {
           detectedAt: Date.now(),
           status: 'ACTIVE',
           addedAt: Date.now(),
-          source: 'manual'
+          source: 'manual',
         });
 
         persistAndBroadcast(buildPayload());
@@ -1153,10 +1350,6 @@ if (TG_BOT_TOKEN) {
 
       await bot.launch({ dropPendingUpdates: true });
       console.log('[bot] started (polling)');
-
-      process.once('SIGINT', () => bot.stop('SIGINT'));
-      process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
     } catch (e) {
       console.error('[bot] failed to start:', e?.message || e);
     }
@@ -1165,7 +1358,7 @@ if (TG_BOT_TOKEN) {
   console.log('[bot] TG_BOT_TOKEN missing, bot disabled');
 }
 
-// ------------------- API for WebApp -------------------
+// ------------------- WEBAPP API -------------------
 app.get('/api/user/status', async (req, res) => {
   const id = req.query.tg_id;
   const hasAccess = await checkUser(id);
@@ -1199,10 +1392,14 @@ app.get('/events', (req, res) => {
   });
 
   sseClients.add(res);
+
   if (fs.existsSync(DATA_FILE)) {
     res.write(`event: scheduled_update\ndata: ${fs.readFileSync(DATA_FILE, 'utf8')}\n\n`);
   }
-  req.on('close', () => sseClients.delete(res));
+
+  req.on('close', () => {
+    sseClients.delete(res);
+  });
 });
 
 app.get('/api/live/candles', async (req, res) => {
@@ -1243,7 +1440,7 @@ app.get('/api/live/stream', (req, res) => {
   req.on('close', () => clearInterval(iv));
 });
 
-// ------------------- Frontend serve -------------------
+// ------------------- FRONTEND SERVE -------------------
 app.use(express.static(path.join(__dirname, '../dist')));
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api') || req.path.startsWith('/events')) return;
@@ -1254,5 +1451,9 @@ app.get('*', (req, res) => {
 app.listen(PORT, () => {
   try { loadPersistedSignals(); } catch (_) {}
   console.log(`🚀 Server on ${PORT}`);
+
+  // expire old signals every minute even if scanner fails
+  setInterval(expireOldSignals, 60_000);
+
   runScannerJob();
 });
